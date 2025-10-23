@@ -12,4 +12,4 @@
 module load conda/latest
 conda activate amoc-env
 
-python Fgen_script.py 
+python CESM1_Fgen.py
