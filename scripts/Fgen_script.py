@@ -11,8 +11,7 @@ from pyproj import Geod
 import pickle
 
 
-def dataconcat (model, scenario, variable): # path of the folder containing the netCDF files 
-    dir_path = f"/glade/work/stevenxu/AMOC_models/FgenCalculation/{model}/{variable}/{scenario}"
+def dataconcat (dir_path): # path of the folder containing the netCDF files 
     all_files = glob.glob(os.path.join(dir_path, "*.nc")) 
     
     groups = defaultdict(list) 
@@ -20,13 +19,13 @@ def dataconcat (model, scenario, variable): # path of the folder containing the 
         fname = os.path.basename(fp) 
         model_name = fname.split("_")[2] 
         groups[model_name].append(fp) 
-        datasets = {}
 
+    datasets = {}
     for prefix, files in groups.items(): 
         files = sorted(files) 
         print(f"Concatenating {len(files)} files for {prefix}") 
         ds = xr.open_mfdataset( files, combine="by_coords", parallel=True ) 
-        datasets[prefix] = ds.isel(time=slice(-20 * 12, None)) 
+        datasets[prefix] = ds.isel(time=slice(-30 * 12, None)) 
     
     return datasets 
 
@@ -104,78 +103,106 @@ def compute_fsurf(model,
         WF = WF.isel(time=slice(-last_n_months, None))
 
     # f_surf = -(alpha/cp) * f_heat  - (rho0/rho_fw) * beta * S0 * f_water
-    fsurf = -(alpha / cp) * HF  -  (rho0 / rho_fw) * beta * S0 * WF
+    fsurf = (alpha / cp) * HF  +  (rho0 / rho_fw) * beta * S0 * WF
     fsurf = fsurf.assign_attrs(
         long_name="Buoyancy-relevant surface forcing (Eq. 5)",
-        description="-(alpha/cp)*f_heat - (rho0/rho_fw)*beta*S0*f_water",
+        description="(alpha/cp)*f_heat + (rho0/rho_fw)*beta*S0*f_water",
         units="",
         cp=cp, rho0=rho0, rho_fw=rho_fw, S0=S0
     )
 
-    heat_comp = -(alpha / cp) * HF
-    fw_comp = -(rho0 / rho_fw) * beta * S0 * WF
+    heat_comp = (alpha / cp) * HF
+    fw_comp = (rho0 / rho_fw) * beta * S0 * WF
 
     return xr.Dataset(dict(fsurf=fsurf, rho=rho, heat_comp=heat_comp, fw_comp=fw_comp, vertices_latitude=vertices_latitude, vertices_longitude=vertices_longitude))
 
 
 # -----------------------------------------------------------------------------------------------  
-# Task:
+# Data Loadin:
 
-sst_datasets = dataconcat("ACCESS-CM2", "PIControl", "sea_surface_temperature") 
-sss_datasets = dataconcat("ACCESS-CM2", "PIControl", "sea_surface_salinity") 
-hf_datasets = dataconcat("ACCESS-CM2", "PIControl", "heatflux") 
-wf_datasets = dataconcat("ACCESS-CM2", "PIControl", "waterflux")
+sst_datasets = dataconcat("/glade/work/stevenxu/AMOC_models/sea_surface_temperature/scenarios/PIControl") 
+sss_datasets = dataconcat("/glade/work/stevenxu/AMOC_models/sea_surface_salinity/scenarios/PIControl") 
+hf_datasets = dataconcat("/glade/work/stevenxu/AMOC_models/heatflux/scenarios/PIControl") 
+wf_datasets = dataconcat("/glade/work/stevenxu/AMOC_models/waterflux/scenarios/PIControl")
 
+dir_path = "/glade/work/stevenxu/AMOC_models/areacello"
+all_files = glob.glob(os.path.join(dir_path, "*.nc")) 
+
+area_ds = defaultdict(list) 
+model_names = []
+
+for fp in all_files: 
+    fname = os.path.basename(fp) 
+    model_name = fname.split("_")[2] 
+    area  = xr.open_dataset(fp)["areacello"]
+    model_names.append(model_name)
+    area_ds[model_name].append(area)
+
+# -----------------------------------------------------------------------------------------------
+### CALCULATION PART
+# -----------------------------------------------------------------------------------------------
 # calculate surface density and fsurf
-surf_den_ACCESS = compute_surface_density("ACCESS-CM2", sst_datasets, sss_datasets, last_n_months=240)
-out_ACCESS = compute_fsurf(
-    "ACCESS-CM2",
-    sst_datasets=sst_datasets,
-    sss_datasets=sss_datasets,
-    hf_datasets=hf_datasets,
-    wf_datasets=wf_datasets,
-    last_n_months=240
-)
 
-# Fgen calculation
-    # density intervals
-rho_min = float(out_ACCESS['rho'].isel(time=0).min())
-rho_max = float(out_ACCESS['rho'].isel(time=0).max())
-step_size = 0.1
-rho_classes = np.arange(rho_min, rho_max + step_size, step_size)
+model_names = []
+model_names.append("ACCESS-CM2")
 
-    # area with j,i coordinate data
-area  = xr.open_dataset("/glade/work/stevenxu/AMOC_models/areacello/ACCESS-CM2/areacello_Ofx_ACCESS-CM2_piControl_r1i1p1f1_gn.nc")["areacello"]
+for model in model_names:
+    Fsurf = compute_fsurf(
+        model,
+        sst_datasets=sst_datasets,
+        sss_datasets=sss_datasets,
+        hf_datasets=hf_datasets,
+        wf_datasets=wf_datasets,
+        last_n_months=240
+    )
 
-    # create a mask to filter by latitude
-lat   = out_ACCESS["latitude"].stack(points=("j","i"))
-mask_pts = lat.where(lat > 30, drop=True).points
+    # Fgen calculation
+        # density intervals
+    rho_min = float(Fsurf['rho'].isel(time=0).min())
+    rho_max = float(Fsurf['rho'].isel(time=0).max())
+    step_size = 0.001
+    rho_classes = np.arange(rho_min, rho_max + step_size, step_size)
 
-    # stack or flatten data into 1d array
-fsurf = out_ACCESS["fsurf"].stack(points=("j","i")).sel(points=mask_pts)
-rho   = out_ACCESS["rho"].stack(points=("j","i")).sel(points=mask_pts)
-area  = area.stack(points=("j","i")).sel(points=mask_pts)
+        # area with j,i coordinate data
+    area  = area_ds[model][0]
 
-    # weighted
-weighted_fsurf = fsurf * area
+        # create a mask to filter by latitude
+    lat   = Fsurf["latitude"].stack(points=("j","i"))
+    mask_pts = lat.where(lat > 30, drop=True).points
 
-    # unstack back to original shape
-weighted_fsurf = weighted_fsurf.unstack("points")  
-rho = rho.unstack("points") 
+        # stack or flatten data into 1d array
+    fsurf = Fsurf["fsurf"].chunk({"time": 1, "j": 200, "i": 200})
+    rho   = Fsurf["rho"].chunk({"time": 1, "j": 200, "i": 200})
+    fsurf = fsurf.stack(points=("j","i")).sel(points=mask_pts)
+    rho   = rho.stack(points=("j","i")).sel(points=mask_pts)
+    area  = area.stack(points=("j","i")).sel(points=mask_pts)
+
+        # weighted
+    weighted_fsurf = fsurf * area
+
+        # unstack back to original shape
+    weighted_fsurf = weighted_fsurf.unstack("points")  
+    rho = rho.unstack("points") 
 
     # Summing up by dentisy interval
-Fgen_org = weighted_fsurf.groupby_bins(rho, bins=rho_classes, right=False).sum(dim=("j","i")) / step_size /1e6
+    Fgen_org = weighted_fsurf.groupby_bins(rho, bins=rho_classes, right=False).sum(dim=("j","i")) / step_size /1e6
 
     # adding centered coordinate for density intervals
-rho_centers = (rho_classes[:-1] + rho_classes[1:]) / 2
+    rho_centers = (rho_classes[:-1] + rho_classes[1:]) / 2
 
     # organizing
-Fgen = Fgen_org.assign_coords(rho_center=("rho_bins", rho_centers))
-Fgen = Fgen.rename(rho_bins="rho_intervals")
-Fgen = Fgen.rename('Fgen')
+    Fgen = Fgen_org.assign_coords(rho_center=("rho_bins", rho_centers))
+    Fgen = Fgen.rename(rho_bins="rho_intervals")
+    Fgen = Fgen.rename('Fgen')
+    Fgen = (
+        Fgen
+        .swap_dims({'rho_intervals': 'rho_center'})      
+        .reset_coords('rho_intervals', drop=True)        
+        .sortby('rho_center')                            
+    )
 
-    # Saving Fgen data
-save_path = "/glade/work/stevenxu/AMOC_models/ACCESS-CM2_Fgen.pkl"
-with open(save_path, "wb") as f:
-    pickle.dump(Fgen, f)
+        # Saving Fgen data
+    save_path = f"/glade/work/stevenxu/AMOC_models/{model}_Fgen.pkl"
+    with open(save_path, "wb") as f:
+        pickle.dump(Fgen, f)
 

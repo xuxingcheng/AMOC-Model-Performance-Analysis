@@ -1,13 +1,13 @@
 #!/bin/bash -l
 #PBS -N Fgen_ACCESS_Calculation
 #PBS -A UWAS0157
-#PBS -l walltime=00:10:00
+#PBS -l walltime=00:20:00
 #PBS -q casper@casper-pbs
 #PBS -j oe
 #PBS -k eod
 #PBS -m abe
 #PBS -M xingcx2@uw.edu
-#PBS -l select=1:ncpus=8:mpiprocs=1:mem=32GB
+#PBS -l select=2:ncpus=32:mpiprocs=1:mem=64GB
 
 module load conda/latest
 conda activate amoc-env
