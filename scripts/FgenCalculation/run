@@ -1,0 +1,16 @@
+#!/bin/bash -l
+#PBS -N Fgen_Calculation
+#PBS -A UWAS0157
+#PBS -l walltime=00:20:00
+#PBS -q casper@casper-pbs
+#PBS -j oe
+#PBS -k eod
+#PBS -m abe
+#PBS -M xingcx2@uw.edu
+#PBS -l select=2:ncpus=32:mpiprocs=1:mem=128GB
+
+module load conda/latest
+conda activate amoc-env
+
+papermill /glade/u/home/stevenxu/AMOCproject/scripts/FgenCalculation/Fgen_calculation_ACCESS-ESM1-5.ipynb /glade/u/home/stevenxu/AMOCproject/scripts/FgenCalculation/result_Fgen_calculation_ACCESS-ESM1-5_result.ipynb
+
