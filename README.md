@@ -1,56 +1,32 @@
-# AMOC-Model-Performance-Analysis
+# AMOC FAIR Emission Modeling
 
-This project analyzes the Atlantic Meridional Overturning Circulation (AMOC) using climate model outputs. It provides scripts and notebooks for data import, processing, visualization, and evaluation of AMOC-related variables under different scenarios.
+Personal workbench for simplifying FAIR model inputs by ranking/ filtering emission species and feeding FAIR with forecasted emissions (ARIMA and Chronos time-series models). Not intended as a polished release.
 
-## Directory Structure
+## What this repo is for
+- Rank species importance and trim FAIR inputs to the essentials.
+- Generate emission forecasts with ARIMA and Chronos ML models.
+- Run FAIR with these pared-down inputs and compare against the original model.
+- Inspect radiative forcing/temperature impacts and keep plots for quick review.
 
-- `output/`  
-	Contains model availability information and summary plots.
-	- `available_models.txt`: List of available models.
-	- `msftmz_all_models.png`: Visualization of AMOC streamfunction across models.
 
-- `scripts/`  
-	Python and Jupyter scripts for data analysis and visualization.
-	- `findModels.ipynb`: Identifies available models and their data.
-	- `model_test.ipynb`: Tests and explores model data.
-	- `ssp370_model_eva.ipynb`: Evaluates AMOC under SSP370 scenario.
-	- `sourceID/`: Contains raw data files for various ocean variables (e.g., temperature, salinity, streamfunction).
 
-## Main Features
+## Key notebooks
+- `Original Model.ipynb` — Baseline FAIR runs.
+- `Simplified_Model_Extension.ipynb` / `Simplified_Model_RCIMP.ipynb` — FAIR with species filtering and scenario variants.
+- `Max Forcing Analysis.ipynb` — Ranks species (max forcing, coeff. of variation) to drop low-impact species.
+- `ModelEvaluation_Extension.ipynb` / `ModelEvaluation_RCIMP.ipynb` — Compare simplified/extended models to the baseline.
+- `Fair Tests.ipynb` — Scratchpad experiments.
+- `examples/` — FAIR reference runs (CO₂ effects, CMIP6 SSPs, data import, equilibrium checks).
+- `graph_outputs/` — Saved plots for before/after comparisons.
+- `TOP_species_extension.txt`, `TOP_species_rcimp_modified.txt` — Current ranked/selected species lists.
 
-- **Data Import & Concatenation**: Loads and concatenates NetCDF files for multiple models and scenarios using xarray.
-- **Unit Conversion**: Converts physical units (e.g., kg/s to Sverdrup) for AMOC streamfunction.
-- **Visualization**: Plots AMOC strength and trends for individual models and across all models, including rolling mean smoothing.
-- **Model Evaluation**: Compares AMOC performance and variability between models under different climate scenarios.
+## Typical workflow
+1) Rank species in `Max Forcing Analysis.ipynb`; update the TOP_species files if the cutoff changes.
+2) Fit ARIMA and Chronos forecasts for emissions; export forecasted series.
+3) Feed forecasted/filtered emissions into the simplified FAIR notebooks and run.
+4) Review outputs in `graph_outputs/` to see performance vs the original model.
 
-## Requirements
-
-- Python 3.x
-- xarray
-- numpy
-- matplotlib
-- glob
-- cartopy (for map visualizations)
-- gsw (for seawater calculations)
-
-Install dependencies with:
-```bash
-pip install xarray numpy matplotlib cartopy gsw
-```
-
-## Usage
-
-1. Place NetCDF files for each model and scenario in the appropriate directory (e.g., `/glade/work/<username>/AMOC_models/scenarios/ssp370`).
-2. Open and run the Jupyter notebooks in `scripts/` to process and visualize the data.
-3. Review output plots and summary files in the `output/` directory.
-
-## Example Workflow
-
-- Run `ssp370_model_eva.ipynb` to evaluate AMOC under the SSP370 scenario.
-- Use `findModels.ipynb` to list available models and their data coverage.
-- Visualize AMOC streamfunction and trends using the provided plotting scripts.
-
-## License
-
-This project is for research and educational purposes. Please cite appropriately if used in publications.
-# AMOC-Model-Performance-Analysis
+## Notes
+- This is for my own analyses; paths and assumptions are hard-coded in places.
+- Ensure `graph_outputs/` exists before running notebooks that save figures.
+- `.idea/` and other IDE artifacts are safe to ignore.
