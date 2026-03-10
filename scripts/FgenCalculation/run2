@@ -1,0 +1,36 @@
+#!/bin/bash -l
+#PBS -N Fgen_Calculation
+#PBS -A UWAS0157
+#PBS -l walltime=06:00:00
+#PBS -q develop@desched1
+#PBS -j oe
+#PBS -k eod
+#PBS -m abe
+#PBS -M xingcx2@uw.edu
+#PBS -l select=4:ncpus=64:mem=64GB
+#PBS -l place=scatter:shared
+
+set -eo pipefail
+
+# Run from the directory where you submitted the job
+cd "$PBS_O_WORKDIR"
+
+echo "=== JOB INFO ==="
+echo "HOST: $(hostname)"
+echo "NODES:"
+uniq "$PBS_NODEFILE"
+echo "Total slots (nodefile lines): $(wc -l < "$PBS_NODEFILE")"
+echo "WORKDIR: $PBS_O_WORKDIR"
+date
+
+# NCAR: load conda module inside batch jobs before activating env
+module load conda/latest
+conda activate amoc-env
+
+# Avoid oversubscription by threaded libs
+export OMP_NUM_THREADS=1
+export OPENBLAS_NUM_THREADS=1
+export MKL_NUM_THREADS=1
+export NUMEXPR_NUM_THREADS=1
+
+python /glade/u/home/stevenxu/AMOCproject/scripts/FgenCalculation/Fgenrun2.py
