@@ -21,8 +21,8 @@ import dask
 warnings.filterwarnings("ignore")
 warnings.filterwarnings("ignore", message="Not a valid ID")
 
-excluding_models = ["CESM2", 'MIROC6', 'MPI-ESM1-2-HR', 'MPI-ESM1-2-LR', 'FGOALS-g3', 'CanESM5-1', 'GISS-E2-2-G', 'NorESM2-LM']# models not included in calculation
-#excluding_models = []
+excluding_models = ["CESM2", 'MPI-ESM1-2-LR', 'FGOALS-g3', 'CanESM5-1', 'GISS-E2-2-G', 'NorESM2-LM']# models not included in calculation
+#excluding_models = ['MPI-ESM1-2-HR']
 models = []
 
 def dataconcat(scenario, variable):
@@ -80,6 +80,7 @@ hf_datasets = dataconcat("PIControl", "heatflux")
 wf_datasets = dataconcat("PIControl", "waterflux")
 models = set(models)
 
+
 # %%
 def subtract_years_cftime(t, years):
     """Return a new cftime object with years subtracted (same month/day)."""
@@ -114,9 +115,10 @@ def align_time(model, lastNyear):
     hf_datasets[model]  = hf_datasets[model].sel(time=slice(start_time, end_time))
     wf_datasets[model]  = wf_datasets[model].sel(time=slice(start_time, end_time))
 
-
+    
 for model in models:
     align_time(model, 20)
+
 
 # %% [markdown]
 # # Calculate sea surface density
@@ -164,6 +166,7 @@ def compute_surface_density(model, sst_datasets, sss_datasets, last_n_months=Non
 
 #surf_den_ACCESS = compute_surface_density("NorESM2-LM", sst_datasets, sss_datasets, last_n_months=240)
 #surf_den_ACCESS
+
 
 # %% [markdown]
 # # Calculate F surf
@@ -221,8 +224,10 @@ for model in models:
          last_n_months=240
     )
 
+
 # %%
 ij_models = []
+xy_models = []
 i_models = []
 norm_models = []
 
@@ -231,10 +236,13 @@ for model_name, ds in Fsurf_datasets.items():
 
     if {'i', 'j'}.issubset(dims):
         ij_models.append(model_name)
+    elif {'x', 'y'}.issubset(dims):
+        xy_models.append(model_name)
     elif 'i' in dims and 'j' not in dims:
         i_models.append(model_name)
     elif {'lat', 'lon'}.issubset(dims):
         norm_models.append(model_name)
+
 
 # %% [markdown]
 # # Calculating Fgen at single timepoint
@@ -247,9 +255,11 @@ for model_name, ds in Fsurf_datasets.items():
 rho_min = 1015
 rho_max = 1030
 
+
 # %%
 step_size = 0.05
 rho_classes = np.arange(rho_min - step_size, rho_max + step_size, step_size)
+
 
 # %% [markdown]
 # ### Dataset for area at each grid cell
@@ -266,13 +276,26 @@ for fp in all_files:
     area  = xr.open_dataset(fp)["areacello"]
     model_names.append(model_name)
     area_ds[model_name].append(area)
-	
+    
+
 
 # %% [markdown]
 # Use ACCESS one for missing areacello
 
 # %%
 area_ds['FGOALS-f3-L'] = [da.copy(deep=True) for da in area_ds['ACCESS-CM2']]
+
+# %% [markdown]
+# Check if all models have corresponding areacello
+
+# %%
+missing = [m for m in models if m not in area_ds]
+
+if missing:
+    for m in missing:
+        print(m)
+else:
+    print("All models exist in area_ds")
 
 # %% [markdown]
 # Align areacello and actual data (180,288 -> 90, 144)
@@ -298,6 +321,7 @@ print("Area  grid:", area_coarse.sizes["lat"], area_coarse.sizes["lon"])
 # 3) save it for later use
 area_ds["GISS-E2-1-G-CC"][0] = area_coarse
 
+
 # %% [markdown]
 # ### Integration
 
@@ -306,6 +330,7 @@ area_ds["GISS-E2-1-G-CC"][0] = area_coarse
 
 # %%
 Fgen_dict = {}
+
 
 # %% [markdown]
 # #### (i) models
@@ -370,6 +395,7 @@ for model, Fsurf_data in Fsurf_datasets.items():
 
     Fgen_dict[model] = Fgen
     print(f"Completed Fgen calculation for {model}")
+
 
 # %% [markdown]
 # #### (i, j) models
@@ -450,6 +476,85 @@ for model, Fsurf_data in Fsurf_datasets.items():
     Fgen_dict[model] = Fgen
     print(f"Completed Fgen calculation for {model}")
 
+
+# %% [markdown]
+# #### (x, y) models
+
+# %%
+for model, Fsurf_data in Fsurf_datasets.items():
+    if model not in xy_models: # 
+        continue
+
+    # -------------------------
+    # 1) Build mask (y,x) and get kept points (MultiIndex labels)
+    # -------------------------
+    mask = (Fsurf_data["latitude"] > 45)
+
+    mask_s = mask.stack(points=("y", "x"))  # MultiIndex points=(y,x)
+    keep_pts = mask_s.where(mask_s, drop=True).coords["points"]
+
+    # -------------------------
+    # 2) Stack fields and select kept points (still lazy xarray)
+    # -------------------------
+    fsurf_s = Fsurf_data["fsurf"].stack(points=("y", "x")).sel(points=keep_pts)
+    heat_s  = Fsurf_data["heat_comp"].stack(points=("y", "x")).sel(points=keep_pts)
+    fw_s    = Fsurf_data["fw_comp"].stack(points=("y", "x")).sel(points=keep_pts)
+    rho_s   = Fsurf_data["rho"].stack(points=("y", "x")).sel(points=keep_pts)
+
+    # areacello (pick the first one if your area_ds stores a list per model)
+    area1 = area_ds[model][0]
+    area_s = area1.stack(points=("y", "x")).sel(points=keep_pts)
+
+    # -------------------------
+    # 3) Apply weights (still xarray), then convert to NumPy once
+    #    Keep as (time, points) for speed (no need to unstack!)
+    # -------------------------
+    wf_s  = (fsurf_s * area_s)
+    wh_s  = (heat_s  * area_s)
+    wfw_s = (fw_s    * area_s)
+
+    # OPTIONAL: restrict time for testing (matches your i-model testing)
+    """wf_s  = wf_s.isel(time=slice(0, 1))
+    wh_s  = wh_s.isel(time=slice(0, 1))
+    wfw_s = wfw_s.isel(time=slice(0, 1))
+    rho_s = rho_s.isel(time=slice(0, 1))"""
+
+    timepoints = rho_s["time"].values
+
+    # Convert to numpy arrays ONCE (prevents pandas/dask recursion issues)
+    wf_np   = wf_s.values      # shape (time, points)
+    wh_np   = wh_s.values
+    wfw_np  = wfw_s.values
+    rho_np  = rho_s.values     # density at points
+    area_np = area_s.values    # shape (points,)
+
+    # -------------------------
+    # 4) Main loops (time x rho_bins), vectorized across points
+    # -------------------------
+    rows = []
+    for t in range(len(timepoints)):
+        rho_t = rho_np[t, :]
+
+        for rhoclass in rho_classes:
+            rhobot = rhoclass
+            rhotop = rhoclass + step_size
+
+            idx = np.where((rho_t > rhobot) & (rho_t < rhotop))[0]
+
+            fgen_value  = float(np.nansum(wf_np[t, idx])  / step_size / 1e6)
+            heat_value  = float(np.nansum(wh_np[t, idx])  / step_size / 1e6)
+            fw_value    = float(np.nansum(wfw_np[t, idx]) / step_size / 1e6)
+            area_sum    = float(np.nansum(area_np[idx]))
+
+            rows.append([t, rhoclass + step_size/2, fgen_value, heat_value, fw_value, area_sum])
+
+    Fgen = pd.DataFrame(rows, columns=["time", "rho", "Fgen", "HeatFlux", "FreshwaterFlux", "AreaSum"])
+    Fgen = Fgen.groupby("rho", as_index=False)[["Fgen", "HeatFlux", "FreshwaterFlux", "AreaSum"]].mean()
+
+    Fgen_dict[model] = Fgen
+    print(f"Completed Fgen calculation for {model}")
+
+
 # %% [markdown]
 # #### (lat, lon) models
 
@@ -521,11 +626,13 @@ for model, Fsurf_data in Fsurf_datasets.items():
     Fgen_dict[model] = Fgen
     print(f"Completed Fgen calculation for {model}")
 
+
 # %%
 import pickle
 
 save_path = "/glade/work/stevenxu/AMOC_models/Fgen_Allmodels.pkl"
 with open(save_path, "wb") as f:
     pickle.dump(Fgen_dict, f)
+
 
 
