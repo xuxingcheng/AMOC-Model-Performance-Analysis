@@ -12,4 +12,4 @@
 module load conda/latest
 conda activate amoc-env
 
-papermill /glade/u/home/stevenxu/AMOCproject/scripts/FgenCalculation/Fgen_calculation_all.ipynb /glade/u/home/stevenxu/AMOCproject/scripts/FgenCalculation/result_Fgen_calculation_all.ipynb
+python /glade/u/home/stevenxu/AMOCproject/scripts/FgenCalculation/dataDownload.py
