@@ -1,13 +1,13 @@
 #!/bin/bash -l
 #PBS -N Fgen_Calculation
 #PBS -A UWAS0157
-#PBS -l walltime=6:00:00
+#PBS -l walltime=4:00:00
 #PBS -q develop@desched1
 #PBS -j oe
 #PBS -k eod
 #PBS -m abe
 #PBS -M xingcx2@uw.edu
-#PBS -l select=4:ncpus=64:mem=128GB
+#PBS -l select=4:ncpus=64:mem=64GB
 #PBS -l place=scatter:shared
 
 set -eo pipefail
@@ -33,4 +33,4 @@ export OPENBLAS_NUM_THREADS=1
 export MKL_NUM_THREADS=1
 export NUMEXPR_NUM_THREADS=1
 
-python /glade/u/home/stevenxu/AMOCproject/scripts/FgenCalculation/FgenCloudrun.py
+python /glade/u/home/stevenxu/AMOCproject/scripts/FgenCalculation/Fgenrun2_streaming.py

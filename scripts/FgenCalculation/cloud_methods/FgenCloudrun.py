@@ -13,6 +13,7 @@ import pandas as pd
 import warnings
 import dask
 import intake
+import gc
 
 
 # %% [markdown]
@@ -71,6 +72,7 @@ wf_datasets  = get_cloud_datasets("piControl", "wfo")
 
 models = set(models_found)
 print("Final loaded models:", models)
+all_loaded_models = set(models)
 
 # %%
 def subtract_years_cftime(t, years):
@@ -125,6 +127,13 @@ for model in list(models): # Use list(models) so we don't modify the set while i
     align_time(model, 20)
 
 models = valid_models
+unused_models = all_loaded_models - models
+for dct in [sst_datasets, sss_datasets, hf_datasets, wf_datasets]:
+    for model in unused_models:
+        dct.pop(model, None)
+
+print(f"Dropped {len(unused_models)} models after time alignment to save memory.")
+gc.collect()
 
 # %% [markdown]
 # # Calculate sea surface density
@@ -269,7 +278,6 @@ area_dset_dict = area_query.to_dataset_dict(
 )
 
 area_ds = {}
-missing_area_models = []
 
 for full_key, ds in area_dset_dict.items():
     model_name = full_key.split('.')[2]
@@ -288,11 +296,20 @@ validated_models = []
 for model in models:
     if model not in area_ds:
         print(f"⚠ Missing areacello for {model} in the cloud catalog!")
-        missing_area_models.append(model)
     else:
         validated_models.append(model)
 
 models = set(validated_models)  # Update our models set to only include those with area data
+for model in list(area_ds):
+    if model not in models:
+        area_ds.pop(model, None)
+for model in list(Fsurf_datasets):
+    if model not in models:
+        Fsurf_datasets.pop(model, None)
+
+# Raw cloud inputs are no longer needed after F_surf is built.
+del sst_datasets, sss_datasets, hf_datasets, wf_datasets
+gc.collect()
 
 print(f"\nSuccessfully loaded areacello for {len(area_ds)} models.")
 
@@ -662,6 +679,4 @@ import pickle
 save_path = "/glade/work/stevenxu/AMOC_models/Fgen_Allmodels.pkl"
 with open(save_path, "wb") as f:
     pickle.dump(Fgen_dict, f)
-
-
 

@@ -18,11 +18,14 @@ import dask
 # # Data Import
 
 # %%
+from sys import prefix
+
+
 warnings.filterwarnings("ignore")
 warnings.filterwarnings("ignore", message="Not a valid ID")
 
-excluding_models = ["CESM2", 'MPI-ESM1-2-LR', 'FGOALS-g3', 'CanESM5-1', 'GISS-E2-2-G', 'NorESM2-LM']# models not included in calculation
-#excluding_models = ['MPI-ESM1-2-HR']
+excluding_models = ["CESM2"]# models not included in calculation
+#including_models = ['NorESM2-LM']
 models = []
 
 def dataconcat(scenario, variable):
@@ -39,6 +42,9 @@ def dataconcat(scenario, variable):
     for prefix, files in groups.items():
         if prefix in excluding_models:
             continue
+
+        #if prefix not in including_models:
+        #    continue
 
         files = sorted(files)
         print(f"Testing files for {prefix}")
@@ -73,7 +79,7 @@ def dataconcat(scenario, variable):
         models.append(prefix)
 
     return datasets
-              
+
 sst_datasets = dataconcat("PIControl", "sea_surface_temperature") 
 sss_datasets = dataconcat("PIControl", "sea_surface_salinity") 
 hf_datasets = dataconcat("PIControl", "heatflux") 
@@ -203,14 +209,7 @@ def compute_fsurf(model,
 
     return xr.Dataset(dict(fsurf=fsurf, rho=rho, heat_comp=heat_comp, fw_comp=fw_comp))
 
-Fsurf_data = compute_fsurf(
-    "CanESM5",
-    sst_datasets=sst_datasets,
-    sss_datasets=sss_datasets,
-    hf_datasets=hf_datasets,
-    wf_datasets=wf_datasets,
-    last_n_months=240
-)
+
 
 Fsurf_datasets = {}
 for model in models:
@@ -242,6 +241,13 @@ for model_name, ds in Fsurf_datasets.items():
         i_models.append(model_name)
     elif {'lat', 'lon'}.issubset(dims):
         norm_models.append(model_name)
+
+
+# %%
+print('ij_models:', ij_models)
+print('xy_models:', xy_models)
+print('i_models:', i_models)
+print('norm_models:', norm_models)
 
 
 # %% [markdown]
@@ -284,6 +290,7 @@ for fp in all_files:
 
 # %%
 area_ds['FGOALS-f3-L'] = [da.copy(deep=True) for da in area_ds['ACCESS-CM2']]
+area_ds['FGOALS-g3'] = [da.copy(deep=True) for da in area_ds['ACCESS-CM2']]
 
 # %% [markdown]
 # Check if all models have corresponding areacello
@@ -301,25 +308,26 @@ else:
 # Align areacello and actual data (180,288 -> 90, 144)
 
 # %%
-fs = Fsurf_datasets["GISS-E2-1-G-CC"]
-area0 = area_ds["GISS-E2-1-G-CC"][0]          # (lat:180, lon:288)
+if "GISS-E2-1-G-CC" in model:
+    fs = Fsurf_datasets["GISS-E2-1-G-CC"]
+    area0 = area_ds["GISS-E2-1-G-CC"][0]          # (lat:180, lon:288)
 
-# 1) coarsen to (lat:90, lon:144) — use SUM for area
-area_coarse = area0.coarsen(lat=2, lon=2, boundary="trim").sum()
+    # 1) coarsen to (lat:90, lon:144) — use SUM for area
+    area_coarse = area0.coarsen(lat=2, lon=2, boundary="trim").sum()
 
-# 2) align to Fsurf grid (safe even if tiny coord diffs)
-area_coarse = area_coarse.sel(
-    lat=fs["lat"],
-    lon=fs["lon"],
-    method="nearest"
-)
+    # 2) align to Fsurf grid (safe even if tiny coord diffs)
+    area_coarse = area_coarse.sel(
+        lat=fs["lat"],
+        lon=fs["lon"],
+        method="nearest"
+    )
 
-# optional: sanity check
-print("Fsurf grid:", fs.sizes["lat"], fs.sizes["lon"])
-print("Area  grid:", area_coarse.sizes["lat"], area_coarse.sizes["lon"])
+    # optional: sanity check
+    print("Fsurf grid:", fs.sizes["lat"], fs.sizes["lon"])
+    print("Area  grid:", area_coarse.sizes["lat"], area_coarse.sizes["lon"])
 
-# 3) save it for later use
-area_ds["GISS-E2-1-G-CC"][0] = area_coarse
+    # 3) save it for later use
+    area_ds["GISS-E2-1-G-CC"][0] = area_coarse
 
 
 # %% [markdown]
