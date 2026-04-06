@@ -7,8 +7,8 @@
 #PBS -k eod
 #PBS -m abe
 #PBS -M xingcx2@uw.edu
-#PBS -l select=4:ncpus=64:mem=64GB
-#PBS -l place=scatter:shared
+#PBS -l select=1:ncpus=64:mem=64GB
+#PBS -l place=shared
 
 set -eo pipefail
 

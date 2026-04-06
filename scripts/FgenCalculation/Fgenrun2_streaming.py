@@ -26,6 +26,7 @@ DEFAULT_STEP_SIZE = 0.05
 DEFAULT_RHO_MIN = 1015.0
 DEFAULT_RHO_MAX = 1030.0
 DEFAULT_EXCLUDING_MODELS = {"CESM2"}
+ENGINE_FALLBACK_ORDER = ("h5netcdf", "scipy", "netcdf4")
 AREA_ALIASES = {
     "FGOALS-f3-L": "ACCESS-CM2",
     "FGOALS-g3": "ACCESS-CM2",
@@ -138,62 +139,130 @@ def get_candidate_models(registry, include_models=None, exclude_models=None):
     return sorted(models)
 
 
-def validate_files(files):
-    clean_files = []
-    for path in files:
-        if os.path.getsize(path) == 0:
-            print(f"  Skipping empty file: {path}")
-            continue
-        try:
-            xr.open_dataset(path, engine="netcdf4").close()
-            clean_files.append(path)
-        except Exception as exc:
-            print(f"  Skipping unreadable file: {path}")
-            print(f"    Error: {exc!r}")
-    return clean_files
+def is_classic_netcdf_error(exc):
+    message = str(exc).lower()
+    needles = (
+        "file signature not found",
+        "not a valid netcdf 4 file",
+        "not a netcdf 4 file",
+        "unknown file format",
+        "not a valid netcdf file",
+    )
+    return any(needle in message for needle in needles)
 
 
-def open_mfdataset_once(model, variable_key, files, time_chunk):
-    open_kwargs = {
+def summarize_engine_errors(errors):
+    parts = []
+    for engine, exc in errors.items():
+        parts.append(f"{engine}: {exc!r}")
+    return "; ".join(parts)
+
+
+def build_mfdataset_kwargs(engine, time_chunk):
+    return {
         "combine": "by_coords",
         "coords": "minimal",
         "data_vars": "minimal",
         "compat": "override",
         "join": "override",
         "parallel": False,
-        "engine": "netcdf4",
+        "engine": engine,
         "use_cftime": True,
         "chunks": {"time": time_chunk},
     }
 
-    try:
-        return xr.open_mfdataset(files, **open_kwargs)
-    except Exception as exc:
-        print(
-            f"{model} {variable_key}: open_mfdataset failed once; "
-            "retrying after filtering bad files."
-        )
-        print(f"  First error: {exc!r}")
-        clean_files = validate_files(files)
-        if not clean_files:
-            raise RuntimeError(f"{model} {variable_key}: no valid files remain") from exc
-        return xr.open_mfdataset(clean_files, **open_kwargs)
+
+def build_dataset_kwargs(engine):
+    return {
+        "engine": engine,
+        "use_cftime": True,
+    }
+
+
+def validate_files(files):
+    clean_files = []
+    for path in files:
+        if os.path.getsize(path) == 0:
+            print(f"  Skipping empty file: {path}")
+            continue
+        ds = None
+        try:
+            ds, _ = open_dataset_with_fallback(path, label=path, log_backend=False)
+            clean_files.append(path)
+        except Exception as exc:
+            print(f"  Skipping unreadable file: {path}")
+            print(f"    Error: {exc!r}")
+        finally:
+            safe_close(ds)
+    return clean_files
+
+
+def open_dataset_with_fallback(path, label, log_backend=True):
+    errors = {}
+    for engine in ENGINE_FALLBACK_ORDER:
+        try:
+            ds = xr.open_dataset(path, **build_dataset_kwargs(engine))
+            if log_backend:
+                print(f"{label}: using backend {engine}")
+            return ds, engine
+        except Exception as exc:
+            errors[engine] = exc
+
+    raise RuntimeError(
+        f"{label}: unable to open dataset with fallback backends: "
+        f"{summarize_engine_errors(errors)}"
+    )
+
+
+def open_mfdataset_once(model, variable_key, files, time_chunk):
+    errors = {}
+    for engine in ENGINE_FALLBACK_ORDER:
+        try:
+            ds = xr.open_mfdataset(files, **build_mfdataset_kwargs(engine, time_chunk))
+            print(f"{model} {variable_key}: using backend {engine}")
+            return ds, engine
+        except Exception as exc:
+            errors[engine] = exc
+
+    print(
+        f"{model} {variable_key}: all backends failed on first pass; "
+        "retrying after filtering bad files."
+    )
+    print(f"  Backend errors: {summarize_engine_errors(errors)}")
+    clean_files = validate_files(files)
+    if not clean_files:
+        raise RuntimeError(f"{model} {variable_key}: no valid files remain")
+
+    retry_errors = {}
+    for engine in ENGINE_FALLBACK_ORDER:
+        try:
+            ds = xr.open_mfdataset(clean_files, **build_mfdataset_kwargs(engine, time_chunk))
+            print(f"{model} {variable_key}: using backend {engine} after file filtering")
+            return ds, engine
+        except Exception as exc:
+            retry_errors[engine] = exc
+
+    raise RuntimeError(
+        f"{model} {variable_key}: unable to open dataset with fallback backends after "
+        f"file filtering: {summarize_engine_errors(retry_errors)}"
+    )
 
 
 def open_model_inputs(model, registry, time_chunk):
     ds_map = {}
+    backend_map = {}
     for variable_key in VARIABLE_SPECS:
         files = registry[model][variable_key]
-        ds_map[variable_key] = open_mfdataset_once(
+        ds_map[variable_key], backend_map[variable_key] = open_mfdataset_once(
             model=model,
             variable_key=variable_key,
             files=files,
             time_chunk=time_chunk,
         )
-    return ds_map
+    return ds_map, backend_map
 
 
-def align_and_trim_inputs(model, opened_ds_map, last_n_years, last_n_months):
+def align_and_trim_inputs(model, opened_ds_map, backend_map, last_n_years, last_n_months):
     end_times = [
         opened_ds_map["tos"]["time"].isel(time=-1).values.item(),
         opened_ds_map["sos"]["time"].isel(time=-1).values.item(),
@@ -214,17 +283,144 @@ def align_and_trim_inputs(model, opened_ds_map, last_n_years, last_n_months):
         selected = ds.sel(time=slice(start_time, min_end_time))
         if last_n_months is not None:
             selected = selected.isel(time=slice(-last_n_months, None))
+        if backend_map.get(variable_key) == "scipy":
+            selected = selected.load()
         trimmed[variable_key] = selected
 
     return trimmed
 
 
-def compute_surface_density(trimmed_ds_map):
+def get_dataarray_spatial_dims(data_array):
+    return tuple(dim for dim in data_array.dims if dim != "time")
+
+
+def assert_nonempty_spatial_grid(model, data_array, label):
+    spatial_dims = get_dataarray_spatial_dims(data_array)
+    if not spatial_dims:
+        raise ValueError(f"{model}: {label} has no spatial dimensions")
+
+    empty_dims = [dim for dim in spatial_dims if data_array.sizes.get(dim, 0) == 0]
+    if empty_dims:
+        dim_text = ", ".join(empty_dims)
+        raise ValueError(
+            f"{model}: empty spatial grid after harmonization/alignment for {label} "
+            f"({dim_text})"
+        )
+
+
+def assert_matching_spatial_grid(model, reference, other, reference_name, other_name):
+    reference_dims = get_dataarray_spatial_dims(reference)
+    other_dims = get_dataarray_spatial_dims(other)
+    if reference_dims != other_dims:
+        raise ValueError(
+            f"{model}: grid mismatch after harmonization: {other_name} dims "
+            f"{other_dims} do not match {reference_name} dims {reference_dims}"
+        )
+
+    for dim in reference_dims:
+        if dim in reference.coords and dim in other.coords:
+            reference_values = reference[dim].values
+            other_values = other[dim].values
+            if reference_values.shape != other_values.shape or not np.array_equal(
+                reference_values,
+                other_values,
+            ):
+                raise ValueError(
+                    f"{model}: grid mismatch after harmonization: {other_name} "
+                    f"coordinate '{dim}' does not match {reference_name}"
+                )
+
+
+def area_weighted_coarsen_to_target(model, variable_name, data_array, area_da, target_array):
+    if get_dataarray_spatial_dims(data_array) != ("lat", "lon"):
+        raise ValueError(
+            f"{model}: cannot coarsen {variable_name}; expected (lat, lon) grid, "
+            f"got {data_array.dims}"
+        )
+
+    if area_da.dims != ("lat", "lon"):
+        raise ValueError(
+            f"{model}: cannot coarsen {variable_name}; areacello dims {area_da.dims} "
+            "do not match expected (lat, lon)"
+        )
+
+    if (
+        area_da.sizes.get("lat") != data_array.sizes.get("lat")
+        or area_da.sizes.get("lon") != data_array.sizes.get("lon")
+    ):
+        raise ValueError(
+            f"{model}: cannot coarsen {variable_name}; areacello shape "
+            f"{area_da.shape} does not match {variable_name} shape "
+            f"{data_array.shape[1:]}"
+        )
+
+    if not np.array_equal(area_da["lat"].values, data_array["lat"].values):
+        area_da = area_da.assign_coords(lat=data_array["lat"])
+    if not np.array_equal(area_da["lon"].values, data_array["lon"].values):
+        area_da = area_da.assign_coords(lon=data_array["lon"])
+
+    area_sum = area_da.coarsen(lat=2, lon=2, boundary="trim").sum()
+    weighted_sum = (data_array * area_da).coarsen(lat=2, lon=2, boundary="trim").sum()
+    coarse = xr.where(area_sum > 0, weighted_sum / area_sum, np.nan)
+    coarse = coarse.assign_coords(lat=target_array["lat"], lon=target_array["lon"])
+    coarse = coarse.transpose(*target_array.dims)
+    coarse.attrs = data_array.attrs.copy()
+
+    print(
+        f"{model} {variable_name}: coarsened from "
+        f"{data_array.sizes['lat']}x{data_array.sizes['lon']} to "
+        f"{target_array.sizes['lat']}x{target_array.sizes['lon']} using area-weighted averaging"
+    )
+    return coarse
+
+
+def harmonize_spatial_grids(model, trimmed_ds_map, area_da):
+    harmonized = dict(trimmed_ds_map)
+    target = harmonized["tos"]["tos"]
+    assert_nonempty_spatial_grid(model, target, "tos")
+
+    for variable_key in ("sos", "hfds"):
+        assert_nonempty_spatial_grid(model, harmonized[variable_key][variable_key], variable_key)
+        assert_matching_spatial_grid(
+            model,
+            target,
+            harmonized[variable_key][variable_key],
+            "tos",
+            variable_key,
+        )
+
+    wfo = harmonized["wfo"]["wfo"]
+    assert_nonempty_spatial_grid(model, wfo, "wfo")
+
+    target_dims = get_dataarray_spatial_dims(target)
+    wfo_dims = get_dataarray_spatial_dims(wfo)
+    if target_dims == ("lat", "lon") and wfo_dims == ("lat", "lon"):
+        is_two_x_finer = (
+            wfo.sizes.get("lat") == target.sizes.get("lat") * 2
+            and wfo.sizes.get("lon") == target.sizes.get("lon") * 2
+        )
+        if is_two_x_finer:
+            coarse_wfo = area_weighted_coarsen_to_target(
+                model=model,
+                variable_name="wfo",
+                data_array=wfo,
+                area_da=area_da,
+                target_array=target,
+            )
+            harmonized["wfo"] = coarse_wfo.to_dataset(name="wfo")
+            wfo = harmonized["wfo"]["wfo"]
+
+    assert_matching_spatial_grid(model, target, wfo, "tos", "wfo")
+    return harmonized
+
+
+def compute_surface_density(model, trimmed_ds_map):
     T, SP = xr.align(
         trimmed_ds_map["tos"]["tos"],
         trimmed_ds_map["sos"]["sos"],
-        join="inner",
+        join="exact",
     )
+    assert_nonempty_spatial_grid(model, T, "tos/sos after align")
     p0 = 0.0
 
     alpha = xr.apply_ufunc(
@@ -258,19 +454,22 @@ def compute_surface_density(trimmed_ds_map):
     return rho, alpha, beta
 
 
-def compute_fsurf(trimmed_ds_map):
+def compute_fsurf(model, trimmed_ds_map, area_da):
     cp = 3990.0
     rho0 = 1027.0
     rho_fw = 1000.0
     S0 = 35.0
 
+    trimmed_ds_map = harmonize_spatial_grids(model, trimmed_ds_map, area_da)
     HF, WF = xr.align(
         trimmed_ds_map["hfds"]["hfds"],
         trimmed_ds_map["wfo"]["wfo"],
-        join="inner",
+        join="exact",
     )
-    rho, alpha, beta = compute_surface_density(trimmed_ds_map)
-    HF, WF, rho, alpha, beta = xr.align(HF, WF, rho, alpha, beta, join="inner")
+    assert_nonempty_spatial_grid(model, HF, "hfds/wfo after align")
+    rho, alpha, beta = compute_surface_density(model, trimmed_ds_map)
+    HF, WF, rho, alpha, beta = xr.align(HF, WF, rho, alpha, beta, join="exact")
+    assert_nonempty_spatial_grid(model, HF, "final fsurf inputs")
 
     fsurf = (alpha / cp) * HF + (rho0 / rho_fw) * beta * S0 * WF
     fsurf = fsurf.rename("fsurf").assign_attrs(
@@ -304,7 +503,8 @@ def load_area_for_model(model, area_index):
 
     ds = None
     try:
-        ds = xr.open_dataset(area_index[source_model][0], engine="netcdf4")
+        label = f"{model} areacello"
+        ds, _ = open_dataset_with_fallback(area_index[source_model][0], label=label)
         area = ds["areacello"]
         if "time" in area.dims:
             area = area.isel(time=0).squeeze()
@@ -316,7 +516,7 @@ def load_area_for_model(model, area_index):
 
 
 def get_spatial_dims(fsurf_ds):
-    dims = tuple(dim for dim in fsurf_ds["fsurf"].dims if dim != "time")
+    dims = get_dataarray_spatial_dims(fsurf_ds["fsurf"])
 
     if dims == ("i",):
         return dims
@@ -370,7 +570,8 @@ def prepare_area_for_fsurf(area_da, fsurf_ds, spatial_dims):
     return area_da
 
 
-def stack_north_of_45(fsurf_ds, area_da, spatial_dims):
+def stack_north_of_45(model, fsurf_ds, area_da, spatial_dims):
+    assert_nonempty_spatial_grid(model, fsurf_ds["fsurf"], "fsurf for latitude mask")
     mask = get_latitude_mask(fsurf_ds, spatial_dims)
     mask_s = mask.stack(points=spatial_dims)
     keep_pts = mask_s.where(mask_s, drop=True).coords["points"]
@@ -459,8 +660,9 @@ def compute_fgen_for_model(model, fsurf_ds, area_da, rho_classes, step_size):
         print(f"Skipping {model}: unsupported spatial dims {fsurf_ds['fsurf'].dims}")
         return None
 
+    assert_nonempty_spatial_grid(model, fsurf_ds["fsurf"], "fsurf before integration")
     area_ready = prepare_area_for_fsurf(area_da, fsurf_ds, spatial_dims)
-    stacked = stack_north_of_45(fsurf_ds, area_ready, spatial_dims)
+    stacked = stack_north_of_45(model, fsurf_ds, area_ready, spatial_dims)
     if stacked is None:
         print(f"Skipping {model}: no points north of 45 degrees.")
         return None
@@ -548,25 +750,32 @@ def main():
     for model in models:
         print(f"\n=== Processing {model} ===")
         opened_ds_map = None
+        backend_map = None
         trimmed_ds_map = None
         area_da = None
         fsurf_ds = None
 
         try:
-            opened_ds_map = open_model_inputs(model, registry, time_chunk=time_chunk)
+            opened_ds_map, backend_map = open_model_inputs(
+                model,
+                registry,
+                time_chunk=time_chunk,
+            )
             trimmed_ds_map = align_and_trim_inputs(
                 model=model,
                 opened_ds_map=opened_ds_map,
+                backend_map=backend_map,
                 last_n_years=args.last_n_years,
                 last_n_months=args.last_n_months,
             )
-            fsurf_ds = compute_fsurf(trimmed_ds_map)
-
             area_da = load_area_for_model(model, area_index)
             if area_da is None:
                 print(f"Skipping {model}: no areacello file or alias.")
                 continue
 
+            # Materialize one model at a time to avoid dask fancy-index bugs during
+            # the later stack/select integration step on mixed backend inputs.
+            fsurf_ds = compute_fsurf(model, trimmed_ds_map, area_da).load()
             fgen = compute_fgen_for_model(
                 model=model,
                 fsurf_ds=fsurf_ds,
@@ -598,7 +807,7 @@ def main():
                 for ds in trimmed_ds_map.values():
                     safe_close(ds)
             safe_close(fsurf_ds)
-            del opened_ds_map, trimmed_ds_map, area_da, fsurf_ds
+            del opened_ds_map, backend_map, trimmed_ds_map, area_da, fsurf_ds
             gc.collect()
 
     if unsaved:
