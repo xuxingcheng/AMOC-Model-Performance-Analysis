@@ -529,23 +529,36 @@ def get_spatial_dims(fsurf_ds):
     return None
 
 
-def get_latitude_mask(fsurf_ds, spatial_dims):
+def normalize_longitude(longitude):
+    return ((longitude + 180) % 360) - 180
+
+
+def get_spatial_mask(fsurf_ds, spatial_dims):
     sample = fsurf_ds["fsurf"].isel(time=0)
 
     if "latitude" in fsurf_ds:
         latitude = fsurf_ds["latitude"]
+        if "longitude" not in fsurf_ds:
+            raise KeyError("No longitude field available for filtering.")
+        longitude = fsurf_ds["longitude"]
         if set(latitude.dims) != set(spatial_dims):
             latitude, _ = xr.broadcast(latitude, sample)
-        return latitude > 45
+        if set(longitude.dims) != set(spatial_dims):
+            longitude, _ = xr.broadcast(longitude, sample)
+        longitude = normalize_longitude(longitude)
+        return (latitude > 45) & (longitude >= -90) & (longitude <= 60)
 
     if "lat" in fsurf_ds.coords:
         latitude = fsurf_ds["lat"]
-        mask = latitude > 45
+        if "lon" not in fsurf_ds.coords:
+            raise KeyError("No lon coordinate available for filtering.")
+        longitude = normalize_longitude(fsurf_ds["lon"])
+        mask = (latitude > 45) & (longitude >= -90) & (longitude <= 60)
         if set(mask.dims) != set(spatial_dims):
             mask, _ = xr.broadcast(mask, sample)
         return mask
 
-    raise KeyError("No latitude or lat coordinate available for filtering.")
+    raise KeyError("No latitude/longitude coordinates available for filtering.")
 
 
 def prepare_area_for_fsurf(area_da, fsurf_ds, spatial_dims):
@@ -572,7 +585,7 @@ def prepare_area_for_fsurf(area_da, fsurf_ds, spatial_dims):
 
 def stack_north_of_45(model, fsurf_ds, area_da, spatial_dims):
     assert_nonempty_spatial_grid(model, fsurf_ds["fsurf"], "fsurf for latitude mask")
-    mask = get_latitude_mask(fsurf_ds, spatial_dims)
+    mask = get_spatial_mask(fsurf_ds, spatial_dims)
     mask_s = mask.stack(points=spatial_dims)
     keep_pts = mask_s.where(mask_s, drop=True).coords["points"]
     if keep_pts.size == 0:
