@@ -1,153 +1,351 @@
 # AMOC Model Performance Analysis
 
-Tools and workflows for computing and comparing **AMOC-relevant surface-forcing diagnostics** across ocean/climate models.
+This repository is an active NCAR/HPC research workspace for comparing
+AMOC-relevant surface-forcing diagnostics across CMIP6 and CESM ocean output.
 
-This repository focuses on deriving water-mass transformation style metrics (notably `Fgen`) from model output, with a primary emphasis on:
+The current workflow does four main things:
 
-- Sea-surface density and thermodynamic coefficients (`rho`, `alpha`, `beta`)
-- Buoyancy-relevant surface forcing (`fsurf`) from heat + freshwater fluxes
-- Density-class integration north of the subpolar North Atlantic (typically `lat > 45°N`)
-- Cross-model comparison of resulting forcing profiles
+- downloads and stages CMIP6 piControl ocean variables,
+- computes sea-surface density and surface forcing diagnostics,
+- integrates forcing by density class for each model,
+- compares those diagnostics with AMOC strength from `msftmz`.
 
----
+## Current Workflow
 
-## Repository layout
+The preferred multi-model calculation is:
 
-```text
-scripts/
-  FgenCalculation/
-    Fgenrun2.py                  # Main multi-model Fgen workflow
-    Fgen_calculation_new.ipynb   # Notebook experimentation
-    old_methods/                 # Earlier versions and exploratory notebooks
-  FgenEvaluation/                # Evaluation notebooks for model-by-model and all-model comparisons
-  CESM1_Fgen.py                  # CESM1-specific single-model workflow
-  CESM1_FWF_Calc.py              # CESM1 freshwater flux assembly helper
-  sourceID/                      # Variable metadata/source notes
-output/
-  AMOC_Strength_all_models.png
-  AMOC_Strength_normalized_all_models.png
-  available_models.txt
+```bash
+python scripts/FgenCalculation/Fgenrun2_streaming.py
 ```
 
----
+The preferred corrected AreaSum calculation is:
 
-## Core workflow
+```bash
+python scripts/FgenCalculation/AreaSumrun_streaming.py
+```
 
-The primary end-to-end script is:
+Both scripts are sequential streaming drivers intended to avoid keeping every
+model in memory at once. They save after each model by default and can resume
+from existing pickle output.
 
-- `scripts/FgenCalculation/Fgenrun2.py`
+PBS wrappers are available for Derecho/Casper-style runs:
 
-### 1) Load and concatenate model data
-The script groups netCDF files by model and variable, filters unreadable/empty files, and opens valid files with xarray/dask.
+```bash
+qsub scripts/FgenCalculation/run
+qsub scripts/FgenCalculation/run2
+```
 
-Expected variables are pulled from scenario folders like:
+`run` launches the CMIP6 downloader. `run2` launches
+`Fgenrun2_streaming.py`.
 
-- `sea_surface_temperature` (`tos`)
-- `sea_surface_salinity` (`sos`)
-- `heatflux` (`hfds`)
-- `waterflux` (`wfo`)
+## Data Layout
 
-### 2) Align time windows
-For each model, all required fields are aligned to a shared trailing window (commonly last 20 years).
+Most scripts assume data under:
 
-### 3) Compute surface density properties
-Using the Gibbs SeaWater package (`gsw`), the script computes:
+```text
+/glade/work/stevenxu/AMOC_models
+```
 
-- `rho` (surface density)
-- `alpha` (thermal expansion coefficient)
-- `beta` (saline contraction coefficient)
+The downloader first writes to:
 
-### 4) Compute buoyancy-relevant forcing (`fsurf`)
-`fsurf` is computed as:
+```text
+/glade/work/stevenxu/AMOC_models/downloads
+```
 
-\[
-fsurf = \frac{\alpha}{c_p} \cdot HF + \frac{\rho_0}{\rho_{fw}} \cdot \beta \cdot S_0 \cdot WF
-\]
+After verification/staging, the calculation scripts expect this layout:
 
-with component terms retained separately as `heat_comp` and `fw_comp`.
+```text
+/glade/work/stevenxu/AMOC_models/
+  sea_surface_temperature/scenarios/PIControl/   # tos
+  sea_surface_salinity/scenarios/PIControl/      # sos
+  heatflux/scenarios/PIControl/                  # hfds
+  waterflux/scenarios/PIControl/                 # wfo
+  areacello/                                     # ocean cell area
+  downloads/                                     # raw ESGF download tree
+```
 
-### 5) Integrate by density class
-For each model, the script:
+`msftmz` remains under the download tree for the AMOC evaluation notebooks.
 
-- Applies a latitude mask (`> 45°N`)
-- Uses `areacello` to area-weight forcing
-- Bins by density classes (`rho_classes`)
-- Integrates and averages over time
-- Stores per-density profiles of:
-  - `Fgen`
-  - `HeatFlux`
-  - `FreshwaterFlux`
-  - `AreaSum`
+## Download And Stage Data
 
-### 6) Save output
-Final outputs are serialized to pickle (`Fgen_Allmodels.pkl`) for later plotting/evaluation.
+Download monthly CMIP6 piControl files for the strict `r1i1p1f1` member:
 
----
+```bash
+python scripts/FgenCalculation/dataDownload.py
+```
 
-## CESM1-specific scripts
+By default this searches ESGF for models with:
 
-- `scripts/CESM1_FWF_Calc.py` builds total freshwater flux (`FWF`) from CESM1 components:
-  - `ROFF_F + IOFF_F + MELT_F + PREC_F + EVAP_F`
-- `scripts/CESM1_Fgen.py` performs a focused CESM1 version of `fsurf` and `Fgen` calculation and saves a model-specific pickle.
+- `tos`
+- `sos`
+- `hfds`
+- `wfo`
+- `msftmz`
 
-These are useful references for debugging and method validation against the general multi-model pipeline.
+and downloads the last 30 years at file granularity.
 
----
+Useful downloader checks:
 
-## Requirements
+```bash
+python scripts/FgenCalculation/dataDownload.py --dry-run
+python scripts/FgenCalculation/dataDownload.py --discover-models-only
+python scripts/FgenCalculation/dataDownload.py --models MIROC6 CanESM5
+```
 
-Typical Python dependencies used in scripts/notebooks:
+Download matching `areacello` files for models already present locally:
+
+```bash
+python scripts/FgenCalculation/areacelloDownload.py
+```
+
+Verify downloaded files and stage passing models into the calculation layout:
+
+```bash
+python scripts/FgenCalculation/verifyDownloads.py
+```
+
+Useful verification modes:
+
+```bash
+python scripts/FgenCalculation/verifyDownloads.py --verify-only
+python scripts/FgenCalculation/verifyDownloads.py --deep-check --verify-only
+python scripts/FgenCalculation/verifyDownloads.py --dry-run
+```
+
+## Fgen Calculation
+
+`scripts/FgenCalculation/Fgenrun2_streaming.py` is the active Fgen driver.
+
+For each model, it:
+
+1. opens `tos`, `sos`, `hfds`, `wfo`, and `areacello`;
+2. aligns all variables to a shared trailing time window;
+3. computes surface `rho`, `alpha`, and `beta` with `gsw`;
+4. computes
+
+```text
+fsurf = (alpha / cp) * hfds + (rho0 / rho_fw) * beta * S0 * wfo
+```
+
+5. applies the North Atlantic geographic mask:
+
+```text
+latitude > 45
+normalized longitude between -90 and 60
+```
+
+6. bins points by density and integrates area-weighted forcing.
+
+Default settings:
+
+```text
+scenario:       PIControl
+last years:     20
+last months:    240
+density range:  1015.0 to 1030.0 kg/m^3
+density step:   0.05 kg/m^3
+output:         /glade/work/stevenxu/AMOC_models/Fgen_Allmodels_streaming.pkl
+excluded model: CESM2
+```
+
+Example focused runs:
+
+```bash
+python scripts/FgenCalculation/Fgenrun2_streaming.py --models MIROC6
+python scripts/FgenCalculation/Fgenrun2_streaming.py --max-models 2
+python scripts/FgenCalculation/Fgenrun2_streaming.py --resume
+python scripts/FgenCalculation/Fgenrun2_streaming.py --time-chunk 240
+```
+
+The output pickle is a dictionary:
+
+```text
+model name -> pandas.DataFrame
+```
+
+Each Fgen DataFrame is averaged over time by density class and contains:
+
+```text
+rho, Fgen, HeatFlux, FreshwaterFlux, AreaSum
+```
+
+Important: the `AreaSum` column in this Fgen output is the mean area in each
+density bin. It is not the corrected whole-model AreaSum metric described
+below.
+
+## Corrected AreaSum Calculation
+
+`scripts/FgenCalculation/AreaSumrun_streaming.py` computes the corrected
+AreaSum as a separate output.
+
+For each model and each time step, it sums `areacello` over grid cells where:
+
+```text
+fsurf is finite
+rho is finite
+area is finite
+fsurf < 0
+rho > rho_min
+the same North Atlantic geographic mask is true
+```
+
+The default threshold is:
+
+```text
+rho_min = 1025.0 kg/m^3
+```
+
+Default output:
+
+```text
+/glade/work/stevenxu/AMOC_models/AreaSum_Allmodels_streaming.pkl
+```
+
+Example runs:
+
+```bash
+python scripts/FgenCalculation/AreaSumrun_streaming.py --models MIROC6
+python scripts/FgenCalculation/AreaSumrun_streaming.py --rho-min 1025.0
+python scripts/FgenCalculation/AreaSumrun_streaming.py --resume
+python scripts/FgenCalculation/AreaSumrun_streaming.py --max-models 2
+```
+
+The output pickle is a dictionary:
+
+```text
+model name -> pandas.DataFrame
+```
+
+Each AreaSum DataFrame contains one row per time step:
+
+```text
+time_index, time, AreaSum
+```
+
+The "whole model" AreaSum used in evaluation is the time mean of that monthly
+`AreaSum` series.
+
+## Evaluation Notebooks
+
+Active evaluation notebooks are in `scripts/FgenEvaluation/`.
+
+- `AMOC_evaluation.ipynb` loads `Fgen_Allmodels_streaming.pkl`, computes AMOC
+  strength from `msftmz`, and makes AMOC-vs-Fgen, heat-flux, freshwater-flux,
+  and negative-area-integral plots.
+- `AreaSum_evaluation.ipynb` loads `AreaSum_Allmodels_streaming.pkl`, inspects
+  one model by default (`MIROC6`), plots its corrected AreaSum time series, and
+  makes the AMOC strength vs mean AreaSum plot across models.
+- `FgenCloud_evaluation.ipynb` and `Fgen_evaluation_allModels.ipynb` are older
+  plotting notebooks for previous pickle formats.
+- `oldEvaluation/` contains earlier model-specific evaluation notebooks.
+
+AMOC strength is evaluated from `msftmz`, using the `atlantic_arctic_ocean`
+basin/sector when that coordinate exists. The Fgen and AreaSum calculations do
+not use a basin mask; they use the geographic latitude/longitude mask above.
+
+Generated plot directories include:
+
+```text
+scripts/FgenEvaluation/AMOCvsFgen_plots/
+scripts/FgenEvaluation/AreaSum_plots/
+output/
+```
+
+## Repository Layout
+
+```text
+AGENTS.md
+README.md
+scripts/
+  FgenCalculation/
+    Fgenrun2_streaming.py        # active streaming Fgen driver
+    AreaSumrun_streaming.py      # active corrected AreaSum driver
+    dataDownload.py              # ESGF CMIP6 piControl downloader
+    areacelloDownload.py         # matching areacello downloader
+    verifyDownloads.py           # download validation and staging
+    run                          # PBS wrapper for downloader
+    run2                         # PBS wrapper for streaming Fgen
+    Fgenrun2.py                  # older all-model Fgen workflow
+    cloud_methods/               # experimental Pangeo/cloud workflows
+    old_methods/                 # historical notebook/script attempts
+  FgenEvaluation/
+    AMOC_evaluation.ipynb
+    AreaSum_evaluation.ipynb
+    FgenCloud_evaluation.ipynb
+    Fgen_evaluation_allModels.ipynb
+    oldEvaluation/
+  CESM1_Fgen.py                  # CESM1-specific Fgen reference workflow
+  CESM1_FWF_Calc.py              # CESM1 freshwater-flux assembly helper
+  example_watermass_calc.py      # reference water-mass transformation code
+  example_northpolemap.py        # plotting/interpolation example
+  sourceID/                      # model availability notes by CMIP variable
+output/
+  available_models.txt
+  AMOC_Strength_all_models.png
+  AMOC_Strength_normalized_all_models.png
+```
+
+## Environment
+
+On NCAR systems, the existing wrappers use:
+
+```bash
+module load conda/latest
+conda activate amoc-env
+```
+
+Common Python dependencies used across the active scripts and notebooks:
 
 - `numpy`
+- `pandas`
 - `xarray`
 - `dask`
-- `pandas`
-- `matplotlib`
 - `gsw`
+- `scipy`
+- `h5netcdf`
 - `netCDF4`
+- `matplotlib`
+- `requests`
 - `cartopy`
 - `pyproj`
 
-Install with your preferred environment manager (conda recommended for geoscience stacks).
+Cloud/experimental notebooks may also need `intake`, `gcsfs`, and zarr-related
+packages.
 
----
+## Validation
 
-## Data assumptions
-
-Current scripts are configured for local HPC paths (e.g., `/glade/work/...`) and CMIP-style netCDF naming conventions. You will likely need to update path constants before running in a different environment.
-
-In particular, check and edit:
-
-- Base directories for input variables
-- Scenario folder names
-- `areacello` location
-- Output save paths
-
----
-
-## Running
-
-A typical run is currently script/notebook-driven:
+Basic syntax checks:
 
 ```bash
-python scripts/FgenCalculation/Fgenrun2.py
+python -m py_compile scripts/FgenCalculation/Fgenrun2_streaming.py
+python -m py_compile scripts/FgenCalculation/AreaSumrun_streaming.py
+python -m py_compile scripts/FgenCalculation/dataDownload.py
+python -m py_compile scripts/FgenCalculation/areacelloDownload.py
+python -m py_compile scripts/FgenCalculation/verifyDownloads.py
 ```
 
-If running on a workstation, consider adapting dask chunking and file loading strategy to available memory.
+Data checks:
 
----
+```bash
+python scripts/FgenCalculation/verifyDownloads.py --verify-only
+python scripts/FgenCalculation/verifyDownloads.py --deep-check --verify-only
+```
 
-## Outputs and evaluation
+Small calculation smoke tests:
 
-- Intermediate and final diagnostics are stored as pickles and visualized in notebooks under:
-  - `scripts/FgenEvaluation/`
-- Pre-generated figures and model lists are in:
-  - `output/`
+```bash
+python scripts/FgenCalculation/Fgenrun2_streaming.py --max-models 1
+python scripts/FgenCalculation/AreaSumrun_streaming.py --max-models 1
+```
 
----
+Full execution depends on the `/glade/work/stevenxu/AMOC_models` data tree.
 
-## Notes
+## Legacy And Experimental Code
 
-- This is an active research workspace and includes exploratory notebooks.
-- Some scripts share repeated logic for different grid conventions (`i/j`, `x/y`, `lat/lon`) and may be consolidated in future refactors.
-- Paths and model exclusions are currently hard-coded in places for reproducibility of in-progress experiments.
+`Fgenrun2.py`, `old_methods/`, the cloud notebooks/scripts, and the CESM1
+scripts are useful references but are not the preferred multi-model production
+path. Keep them when comparing methods or recovering older experiments, but use
+the streaming drivers for new CMIP6 piControl Fgen and corrected AreaSum runs.
+
+Large NetCDF files, generated pickles, dask scratch files, and `__pycache__`
+artifacts should stay out of git.
