@@ -34,6 +34,7 @@ import grids
 
 
 DEFAULT_MODELS = ("E3SM-1-0", "MIROC6", "ICON-ESM-LR")
+METHOD_CHOICES = ("original", "nearest", "binned", "regridder")
 DEFAULT_METHODS = ("original", "nearest", "binned")
 DEFAULT_OUTPUT = Path("/glade/derecho/scratch/stevenxu/tmp/gridtest_Fgen.pkl")
 FSURF_VARIABLES = ("fsurf", "rho", "heat_comp", "fw_comp")
@@ -48,7 +49,7 @@ def parse_args():
     parser.add_argument(
         "--methods",
         nargs="+",
-        choices=DEFAULT_METHODS,
+        choices=METHOD_CHOICES,
         default=list(DEFAULT_METHODS),
     )
     parser.add_argument("--resolution", type=float, default=2.0)
@@ -77,7 +78,8 @@ def build_payload(args):
             "step_size": args.step_size,
             "workflow": (
                 "Compute rho/fsurf on the native grid, then compare native-grid "
-                "integration with nearest and area-binned regridding of diagnostics."
+                "integration with nearest, area-binned, and notebook-style "
+                "xESMF regridding of diagnostics."
             ),
         },
         "results": {method: {} for method in args.methods},
@@ -161,6 +163,37 @@ def align_fsurf_binned(fsurf_ds, native_area_ds, target_grid):
     return xr.Dataset(aligned, attrs={"grid_alignment_method": "binned"})
 
 
+def align_fsurf_regridder(fsurf_ds, target_grid):
+    aligned = {
+        variable: grids.regridder(
+            fsurf_ds,
+            variable,
+            target_grid,
+            method="nearest_s2d",
+            periodic=True,
+        )
+        for variable in FSURF_VARIABLES
+    }
+    return xr.Dataset(aligned, attrs={"grid_alignment_method": "regridder"})
+
+
+def regridder_area_from_native(native_area_ds, target_grid):
+    area = grids.regridder(
+        native_area_ds,
+        "areacello",
+        target_grid,
+        method="nearest_s2d",
+        periodic=True,
+    ).rename("areacello")
+    area = area.fillna(0.0)
+    area.attrs.update(
+        units=native_area_ds["areacello"].attrs.get("units", "m2"),
+        long_name="native ocean-cell area regridded with xESMF nearest_s2d",
+        area_method="notebook-style xe.Regridder nearest_s2d periodic",
+    )
+    return area
+
+
 def calculate_method_fgen(
     method,
     model,
@@ -185,6 +218,10 @@ def calculate_method_fgen(
             aligned_fsurf = align_fsurf_binned(native_fsurf, native_area_ds, target_grid)
             method_fsurf = aligned_fsurf
             method_area = standard_area
+        elif method == "regridder":
+            aligned_fsurf = align_fsurf_regridder(native_fsurf, target_grid)
+            method_fsurf = aligned_fsurf
+            method_area = regridder_area_from_native(native_area_ds, target_grid)
         else:
             raise ValueError(f"Unsupported method: {method}")
 
@@ -296,7 +333,7 @@ def main():
             for method in pending_methods:
                 started = time.perf_counter()
                 try:
-                    if method != "original" and standard_area is None:
+                    if method in {"nearest", "binned"} and standard_area is None:
                         standard_area = standard_area_from_native(
                             native_fsurf,
                             native_area_ds,

@@ -15,6 +15,7 @@ from grids import (
     open_dataset,
     regrid_area_weighted_bins,
     regrid_nearest,
+    regridder,
     regrid_with_xesmf,
     select_first_steps,
     source_valid_area_totals,
@@ -43,6 +44,7 @@ def parse_args():
         choices=(
             "nearest",
             "binned",
+            "regridder",
             "xesmf-bilinear",
             "xesmf-nearest",
             "xesmf-conservative",
@@ -84,6 +86,18 @@ def run_method(method, source, variable, target, model):
             result = regrid_area_weighted_bins(source, variable, target, area)
             source_area = source_valid_area_totals(source, variable, area)
             return result[variable], result["source_area_sum"], source_area
+        if method == "regridder":
+            return (
+                regridder(
+                    source,
+                    variable,
+                    target,
+                    method="nearest_s2d",
+                    periodic=True,
+                ),
+                None,
+                None,
+            )
         if method == "xesmf-bilinear":
             return (
                 regrid_with_xesmf(

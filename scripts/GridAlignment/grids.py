@@ -485,6 +485,64 @@ def regrid_with_xesmf(
     return result
 
 
+def regridder(
+    dataset: xr.Dataset,
+    variable: str,
+    target: xr.Dataset,
+    method: str = "nearest_s2d",
+    periodic: bool = True,
+    weights_file: str | Path | None = None,
+) -> xr.DataArray:
+    """Regrid with the notebook-style ``xe.Regridder(..., periodic=True)`` flow."""
+    xe = _import_xesmf()
+
+    dataset = dataset.copy(deep=False)
+    data_array = dataset[variable]
+    geometry = source_geometry(dataset, data_array)
+    locstream_in = geometry.grid_type == "unstructured"
+    if locstream_in and method not in {"nearest_s2d", "nearest_d2s"}:
+        raise ValueError(
+            "Installed xESMF LocStream support only permits nearest_s2d or nearest_d2s "
+            "for unstructured source grids"
+        )
+
+    if method in {"conservative", "conservative_normed"}:
+        if locstream_in:
+            raise ValueError("Conservative xESMF regridding is unavailable for LocStream input")
+        source_grid = dataset
+    else:
+        source_grid = xr.Dataset(
+            coords={
+                "lat": geometry.latitude,
+                "lon": geometry.longitude,
+            }
+        )
+
+    use_periodic = bool(
+        periodic
+        and not locstream_in
+        and method not in {"conservative", "conservative_normed"}
+    )
+    kwargs = {
+        "locstream_in": locstream_in,
+        "periodic": use_periodic,
+        "unmapped_to_nan": True,
+        "ignore_degenerate": True,
+    }
+    if weights_file is not None:
+        weights_path = Path(weights_file)
+        kwargs["filename"] = str(weights_path)
+        kwargs["reuse_weights"] = weights_path.exists()
+
+    xe_regridder = xe.Regridder(source_grid, target, method, **kwargs)
+    result = xe_regridder(data_array)
+    result = result.assign_coords(lat=target["lat"], lon=target["lon"])
+    result.attrs = data_array.attrs.copy()
+    result.attrs["regrid_method"] = f"regridder_{method}"
+    result.attrs["periodic"] = int(use_periodic)
+    return result
+
+
 def _import_xesmf():
     """Import xESMF despite missing optional fields in ESMPy 8.4.2 metadata."""
     import importlib.metadata as importlib_metadata

@@ -68,6 +68,21 @@ time chunks and reuse xESMF weights.
   code requires. `grids.py` applies a scoped import-time compatibility shim;
   it does not modify the conda environment.
 
+`regrid_regridder.py`
+
+- Implements the notebook-style pattern from `DemonstrateRegridding.ipynb`:
+  construct `xe.Regridder(source, target, method, periodic=True)` and apply it
+  to the field.
+- Defaults to `nearest_s2d`, matching the model-loop example in the notebook.
+- Uses the shared standard grid coordinates and local coordinate detection, so
+  it can be run through the same command-line interface as the other methods.
+- In `comparason_test.py`, the `regridder` method applies the same
+  `nearest_s2d` regridder to `rho`, `fsurf`, `heat_comp`, `fw_comp`, and
+  `areacello`.
+- It is useful for comparing against the notebook workflow. Regridded
+  `areacello` is not area-conserving, so use `binned` or exact conservative
+  weights for integral-sensitive production calculations.
+
 ## Small-batch comparison
 
 The default batch represents all local grid families:
@@ -87,7 +102,7 @@ execution environment:
 ```bash
 python scripts/GridAlignment/test_small_batch.py \
   --models E3SM-1-0 MIROC6 ICON-ESM-LR \
-  --methods xesmf-bilinear xesmf-nearest xesmf-conservative \
+  --methods regridder xesmf-bilinear xesmf-nearest xesmf-conservative \
   --resolution 2 \
   --time-steps 1
 ```
@@ -135,13 +150,15 @@ JSON reports from the development runs are under:
 ## Fgen method comparison
 
 `comparason_test.py` compares the production-style native-grid Fgen result with
-the two universal alignment methods:
+the configured alignment methods:
 
 - `original`: integrate native-grid `rho` and `fsurf` with native `areacello`;
 - `nearest`: regrid native-grid diagnostics by spherical nearest neighbor, then
   integrate with native area assigned to the standard grid;
 - `binned`: source-area-weight native-grid diagnostics into standard-grid cells,
   then integrate with the same assigned standard-grid area.
+- `regridder`: use the `DemonstrateRegridding.ipynb` xESMF `nearest_s2d`
+  periodic regridder pattern for diagnostics and `areacello`.
 
 All methods compute nonlinear `rho` and `fsurf` diagnostics on the native model
 grid first. This isolates the effect of grid alignment from nonlinear diagnostic
@@ -152,7 +169,7 @@ Run the tested default small batch:
 ```bash
 python scripts/GridAlignment/comparason_test.py \
   --models E3SM-1-0 MIROC6 ICON-ESM-LR \
-  --methods original nearest binned \
+  --methods original nearest binned regridder \
   --last-n-months 12 \
   --output /glade/derecho/scratch/stevenxu/tmp/gridtest_Fgen.pkl
 ```
