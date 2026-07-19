@@ -48,6 +48,41 @@ not a universal CLI default: `standard_grid()`, the standalone regridding
 scripts, `test_small_batch.py`, and `comparason_test.py` still default to a
 2-degree target unless `--resolution 1` is passed.
 
+### Raw-First Multi-Model-Mean Experiment
+
+`scripts/FgenCalculation/Fgen_mean_calculation.py` is a separate, intentional
+raw-first experiment. It does not replace the native-grid workflow above. Its
+current production configuration is:
+
+- 16 equal-weight models with matching native `areacello`; exclude `CESM2`,
+  `FGOALS-f3-L`, `FGOALS-g3`, and `SAM0-UNICON`;
+- the final 240 consecutive year-months shared by `tos`, `sos`, `hfds`, and
+  `wfo` for each model, giving 20 samples per calendar month;
+- 12-month source chunks regridded with
+  `grids.regrid_area_weighted_bins()` to the 1-degree `180 x 360` grid before
+  forming per-model January-December climatologies;
+- an equal-model mean only where all four variables are finite for a given
+  model, cell, and month, with the shared contributor count saved as
+  `model_count`;
+- effective `areacello` formed by averaging each model's binned native ocean
+  area over the complete 16-model cohort, treating unassigned cells as zero;
+- Fgen calculated with the helpers in `Fgenrun2_streaming.py` at 0.05 kg m^-3
+  density spacing, producing 302 bin centers that exactly match the legacy
+  streaming profiles.
+
+The default output and checkpoint directory is
+`/glade/work/stevenxu/AMOC_models/MMM_binned_1deg_no_SAM0`. Its four field
+products are `MMM_{tos,sos,hfds,wfo}_binned_1deg.nc`; the diagnostic is
+`MMM_Fgen_binned_1deg.pkl`. The checkpoint fingerprints the scientific
+configuration and every input path, size, and modification time. Do not reuse
+this directory after changing the cohort or inputs; choose a new output
+directory instead. `--resume` reuses validated per-model caches but rebuilds
+the final MMM fields and Fgen result.
+
+The latest validated production run is PBS job `6739144` (exit status 0,
+16/16 models, no checkpoint errors). Preserve its report at
+`/glade/u/home/stevenxu/Fgen_MMM.o6739144`.
+
 ## Important Folders and Files
 
 - `README.md`: high-level project description, data layout, and method summary.
@@ -55,6 +90,13 @@ scripts, `test_small_batch.py`, and `comparason_test.py` still default to a
   multi-model Fgen driver. It processes one model at a time, saves atomically,
   supports resume/model filtering, and supplies helpers reused by the other
   streaming calculations.
+- `scripts/FgenCalculation/Fgen_mean_calculation.py`: resumable raw-first
+  binned MMM driver described above. It keeps 12-month climatology caches,
+  requires the complete configured cohort before aggregation, writes four MMM
+  NetCDFs, reopens them, and calls the existing streaming Fgen helpers.
+- `scripts/FgenCalculation/run_Fgen_mean`: Derecho PBS wrapper for the current
+  16-model no-SAM0 experiment. The model list and output directory are pinned
+  explicitly so they cannot silently inherit a different checkpoint cohort.
 - `scripts/FgenCalculation/AreaSumrun_streaming.py`: area where `fsurf < 0`,
   `rho > rho_min`, and the North Atlantic mask is true. The default threshold
   is 1025 kg m^-3.
@@ -97,6 +139,9 @@ scripts, `test_small_batch.py`, and `comparason_test.py` still default to a
   timestep and prints the returned shape. It defaults to binned 1-degree output.
 - `scripts/GridAlignment/girdtest_Fgen.ipynb`: active grid-method evaluation
   notebook. Its misspelled filename is also intentional repository history.
+- `scripts/GridAlignment/MMM_Comparason.ipynb`: executed comparison of the
+  raw-first MMM Fgen with the equal-model mean of the same 16 legacy streaming
+  profiles. Its misspelled filename is intentional; do not rename it.
 - `scripts/FgenEvaluation/`: active Fgen, filtered/unfiltered AreaSum, average
   heat-flux, and AMOC comparison notebooks plus checked-in plots.
 - `scripts/FgenCalculation/cloud_methods/`: Pangeo/intake alternatives. Treat
@@ -126,6 +171,21 @@ Resume a run or submit the existing PBS job:
 python scripts/FgenCalculation/Fgenrun2_streaming.py --resume --save-every 1
 qsub scripts/FgenCalculation/run2
 ```
+
+Run or resume the current 16-model raw-first MMM experiment:
+
+```bash
+python scripts/FgenCalculation/Fgen_mean_calculation.py \
+  --resume \
+  --time-chunk 12
+qsub /glade/u/home/stevenxu/AMOCproject/scripts/FgenCalculation/run_Fgen_mean
+```
+
+`run_Fgen_mean` uses `$PBS_O_WORKDIR` and joins stderr into stdout. Submit it
+from the directory where the persistent `Fgen_MMM.o<job-id>` report should be
+written. A configuration-fingerprint error means the current cohort or input
+manifest differs from the checkpoint; do not bypass it by editing the stored
+fingerprint or deleting validated production data.
 
 Run the filtered and unfiltered AreaSum variants with different outputs:
 
@@ -200,6 +260,13 @@ Then use the narrowest data-backed check that covers the change:
   representing rectilinear (`E3SM-1-0`), curvilinear (`MIROC6`), and
   unstructured (`ICON-ESM-LR`) grids;
 - target-grid edits: `check_grid_sizes.py` and verify exact `lat`/`lon` sizes;
+- raw-first MMM edits: use a new scratch output directory, test checkpoint
+  resume, and cover rectilinear (`E3SM-1-0`), curvilinear (`MIROC6`), and
+  unstructured (`ICON-ESM-LR`) inputs before a full run. For production,
+  require four identical `time=12, lat=180, lon=360` grids, January-December
+  order, identical area/count fields, maximum assigned-area relative error
+  below `1e-6`, 302 density bins, and exact density-coordinate equality with
+  the selected legacy profiles;
 - xESMF edits: run xESMF separately because ESMPy initialization can depend on
   the HPC environment. Test structured/curvilinear and unstructured inputs
   separately.
@@ -214,9 +281,11 @@ change affects binned or conservative methods.
 - The shared target contract uses dimensions exactly `lat` and `lon`,
   longitude in `[-180, 180)`, cell-center coordinates, and `lat_b`/`lon_b`
   edges. A global 2-degree grid is `90 x 180`; a 1-degree grid is `180 x 360`.
-- Compute nonlinear `rho`, `fsurf`, `heat_comp`, and `fw_comp` on the native
-  model grid before alignment. Regridding `tos`, `sos`, `hfds`, or `wfo` first
-  changes the diagnostic and is not the current comparison design.
+- For `comparason_test.py` and the native-first grid-method comparison, compute
+  nonlinear `rho`, `fsurf`, `heat_comp`, and `fw_comp` on the native model grid
+  before alignment. The raw-first MMM experiment is the documented exception:
+  it intentionally regrids `tos`, `sos`, `hfds`, and `wfo` first to measure a
+  different operation order. Do not mix these two experiment definitions.
 - Use native `areacello` for reference integrations. Nearest and bilinear
   remapping are not area-conserving.
 - `regrid_area_weighted_bins()` is center-bin aggregation, not exact polygon
@@ -275,6 +344,10 @@ change affects binned or conservative methods.
   when the user asks.
 - Notebook outputs can be very large. Do not add execution noise or embedded
   images unless the task is specifically to regenerate notebook analysis.
+- Preserve PBS stdout/stderr reports such as `Fgen_MMM.o<job-id>` unless the
+  user explicitly asks to remove them. They are generated artifacts, but they
+  are also the human-readable production record and should not be included in
+  routine cleanup.
 - Before editing, run `git status --short` and preserve unrelated user changes,
   including tracked notebook outputs and any currently tracked cache files.
 
