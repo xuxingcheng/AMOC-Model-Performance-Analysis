@@ -1,5 +1,5 @@
 #!/bin/bash -l
-#PBS -N Fgen_MMM
+#PBS -N Fgen_MMM_RF
 #PBS -A UWAS0157
 #PBS -q develop@desched1
 #PBS -l walltime=06:00:00
@@ -31,7 +31,7 @@ export MKL_NUM_THREADS=1
 export NUMEXPR_NUM_THREADS=1
 
 python /glade/u/home/stevenxu/AMOCproject/scripts/FgenCalculation/Fgen_mean_calculation.py \
-  --output-dir /glade/work/stevenxu/AMOC_models/MMM_binned_1deg_no_SAM0 \
+  --output-dir /glade/work/stevenxu/AMOC_models/MMM_binned_1deg_no_SAM0_rho_fsurf_first \
   --models \
     ACCESS-CM2 \
     ACCESS-ESM1-5 \

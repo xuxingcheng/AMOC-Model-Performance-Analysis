@@ -4,9 +4,11 @@
 This is an intentionally separate experiment from the production native-grid
 workflow.  Each model's raw ``tos``, ``sos``, ``hfds``, and ``wfo`` fields are
 first aggregated to a shared regular grid with the source-area-weighted binned
-method.  Per-model monthly climatologies are then averaged with equal model
-weight before the existing Fgen helpers are applied to the four saved mean
-files.
+method.  Sea-surface density, heat forcing, freshwater forcing, and their sum
+(``fsurf``) are calculated from each model's regridded monthly climatology
+before equal-model averaging.  The existing Fgen integration then uses these
+saved rho-and-forcing-first MMM fields for density-class assignment and
+surface-forcing integration.
 """
 
 from __future__ import annotations
@@ -40,7 +42,7 @@ import grids
 
 
 DEFAULT_DATA_ROOT = Path(fgen.DATA_ROOT)
-DEFAULT_OUTPUT_DIR = DEFAULT_DATA_ROOT / "MMM_binned_1deg_no_SAM0"
+DEFAULT_OUTPUT_DIR = DEFAULT_DATA_ROOT / "MMM_binned_1deg_no_SAM0_rho_fsurf_first"
 DEFAULT_LEGACY_FGEN = DEFAULT_DATA_ROOT / "Fgen_Allmodels_streaming.pkl"
 DEFAULT_MODELS = (
     "ACCESS-CM2",
@@ -61,10 +63,13 @@ DEFAULT_MODELS = (
     "NorESM2-MM",
 )
 VARIABLE_KEYS = tuple(fgen.VARIABLE_SPECS)
+FORCING_KEYS = ("fsurf", "heat_comp", "fw_comp")
+DERIVED_KEYS = ("rho",) + FORCING_KEYS
+OUTPUT_KEYS = VARIABLE_KEYS + DERIVED_KEYS
 MONTH_NUMBERS = np.arange(1, 13, dtype=np.int16)
 CHECKPOINT_SCHEMA_VERSION = 2
-RESULT_SCHEMA_VERSION = 1
-ALGORITHM_VERSION = 2
+RESULT_SCHEMA_VERSION = 3
+ALGORITHM_VERSION = 4
 AREA_RELATIVE_ERROR_TOLERANCE = 1.0e-6
 GISS_WFO_AREA_COORDINATE_MODELS = {
     "GISS-E2-1-G-CC",
@@ -161,6 +166,7 @@ def build_config(args, input_manifest):
         "scenario": args.scenario,
         "models": list(args.models),
         "variables": list(VARIABLE_KEYS),
+        "derived_variables": list(DERIVED_KEYS),
         "resolution_degrees": float(args.resolution),
         "last_n_years": int(args.last_n_years),
         "last_n_months": int(args.last_n_months),
@@ -169,7 +175,37 @@ def build_config(args, input_manifest):
         "rho_max": float(args.rho_max),
         "step_size": float(args.step_size),
         "temporal_aggregation": "per-model calendar-month climatology",
-        "model_mean": "equal model weight over joint four-variable finite values",
+        "model_mean": (
+            "equal model weight over the shared joint four-variable finite mask "
+            "for all raw and derived MMM fields"
+        ),
+        "density_method": "gsw.density.rho",
+        "density_pressure_dbar": 0.0,
+        "density_aggregation": (
+            "per-model density from regridded monthly-climatological sos and tos, "
+            "then equal-model mean over the joint four-variable finite mask"
+        ),
+        "forcing_coefficient_aggregation": (
+            "alpha and beta calculated separately for each model from regridded "
+            "monthly-climatological sos and tos"
+        ),
+        "surface_forcing_method": "Fgenrun2_streaming.compute_fsurf",
+        "surface_forcing_constants": {
+            "cp_J_kg-1_K-1": 3990.0,
+            "rho0_kg_m-3": 1027.0,
+            "rho_fw_kg_m-3": 1000.0,
+            "S0": 35.0,
+        },
+        "surface_forcing_aggregation": (
+            "per-model heat and freshwater forcing components and fsurf calculated "
+            "from regridded monthly climatologies, then equal-model mean over the "
+            "joint four-variable finite mask"
+        ),
+        "density_binning_source": "saved rho-first MMM field",
+        "surface_forcing_source": (
+            "saved per-model-first MMM fsurf, heat_comp, and fw_comp fields"
+        ),
+        "gsw_version": getattr(fgen.gsw, "__version__", "unknown"),
         "area_method": "mean source area assigned from each model's native tos grid",
         "regrid_method": "source_area_weighted_center_bin_average",
         "input_manifest": input_manifest,
@@ -292,7 +328,7 @@ def final_output_paths(args):
     tag = resolution_tag(args.resolution)
     return {
         key: args.output_dir / f"MMM_{key}_binned_{tag}.nc"
-        for key in VARIABLE_KEYS
+        for key in OUTPUT_KEYS
     }
 
 
@@ -908,10 +944,16 @@ def process_model(
 
 def aggregate_model_climatologies(args, target, config, fingerprint):
     shape = (12, target.sizes["lat"], target.sizes["lon"])
-    sums = {key: np.zeros(shape, dtype=np.float64) for key in VARIABLE_KEYS}
+    sums = {key: np.zeros(shape, dtype=np.float64) for key in OUTPUT_KEYS}
     model_count = np.zeros(shape, dtype=np.uint16)
     area_sum = np.zeros(shape[1:], dtype=np.float64)
-    variable_units = {key: None for key in VARIABLE_KEYS}
+    variable_units = {key: None for key in OUTPUT_KEYS}
+    variable_units.update(
+        rho="kg m-3",
+        fsurf="kg m-2 s-1",
+        heat_comp="kg m-2 s-1",
+        fw_comp="kg m-2 s-1",
+    )
     area_units = None
     coordinate_adjustments = {}
 
@@ -941,17 +983,49 @@ def aggregate_model_climatologies(args, target, config, fingerprint):
                 adjustment = datasets[key].attrs.get("coordinate_adjustment", "none")
                 if adjustment != "none":
                     coordinate_adjustments[f"{model}:{key}"] = adjustment
-            joint_valid = np.logical_and.reduce(
-                [np.isfinite(values[key]) for key in VARIABLE_KEYS]
-            )
-            model_count[joint_valid] += 1
-            for key in VARIABLE_KEYS:
-                sums[key][joint_valid] += values[key][joint_valid]
 
             area_dataset = stack.enter_context(
                 xr.open_dataset(area_cache_path(args, model), engine="h5netcdf")
             )
-            model_area = np.asarray(area_dataset["areacello"].values, dtype=np.float64)
+            model_area_da = area_dataset["areacello"]
+            model_area = np.asarray(model_area_da.values, dtype=np.float64)
+            model_derived = None
+            try:
+                model_derived = fgen.compute_fsurf(model, datasets, model_area_da)
+                helper_constants = {
+                    "cp_J_kg-1_K-1": model_derived["fsurf"].attrs.get("cp"),
+                    "rho0_kg_m-3": model_derived["fsurf"].attrs.get("rho0"),
+                    "rho_fw_kg_m-3": model_derived["fsurf"].attrs.get("rho_fw"),
+                    "S0": model_derived["fsurf"].attrs.get("S0"),
+                }
+                if helper_constants != config["surface_forcing_constants"]:
+                    raise ValueError(
+                        f"{model}: compute_fsurf constants {helper_constants} differ "
+                        f"from fingerprinted constants "
+                        f"{config['surface_forcing_constants']}"
+                    )
+                for key in DERIVED_KEYS:
+                    values[key] = np.asarray(
+                        model_derived[key].values,
+                        dtype=np.float64,
+                    )
+            finally:
+                fgen.safe_close(model_derived)
+
+            joint_valid = np.logical_and.reduce(
+                [np.isfinite(values[key]) for key in VARIABLE_KEYS]
+            )
+            for key in DERIVED_KEYS:
+                invalid_derived = joint_valid & ~np.isfinite(values[key])
+                if np.any(invalid_derived):
+                    raise ValueError(
+                        f"{model}: {key} is invalid at "
+                        f"{np.count_nonzero(invalid_derived)} jointly valid cells"
+                    )
+            model_count[joint_valid] += 1
+            for key in OUTPUT_KEYS:
+                sums[key][joint_valid] += values[key][joint_valid]
+
             model_area_units = area_dataset["areacello"].attrs.get("units", "m2")
             if area_units is None:
                 area_units = model_area_units
@@ -962,20 +1036,38 @@ def aggregate_model_climatologies(args, target, config, fingerprint):
             area_sum += np.nan_to_num(model_area, nan=0.0)
 
     mmm_values = {}
-    for key in VARIABLE_KEYS:
+    for key in OUTPUT_KEYS:
         mean = np.full(shape, np.nan, dtype=np.float64)
         np.divide(sums[key], model_count, out=mean, where=model_count > 0)
         mmm_values[key] = mean
     mean_area = area_sum / len(args.models)
 
     common_attrs = {
-        "workflow": "binned raw fields then per-model monthly climatology then equal-model mean",
+        "workflow": (
+            "binned raw fields then per-model monthly climatology; rho and surface "
+            "forcing components calculated per model before equal-model averaging"
+        ),
         "scenario": config["scenario"],
         "models": json.dumps(list(args.models)),
         "model_count_total": len(args.models),
         "source_months_per_model": config["last_n_months"],
         "temporal_aggregation": config["temporal_aggregation"],
         "model_mean": config["model_mean"],
+        "density_aggregation": config["density_aggregation"],
+        "density_method": config["density_method"],
+        "density_pressure_dbar": config["density_pressure_dbar"],
+        "gsw_version": config["gsw_version"],
+        "density_binning_source": config["density_binning_source"],
+        "forcing_coefficient_aggregation": config[
+            "forcing_coefficient_aggregation"
+        ],
+        "surface_forcing_method": config["surface_forcing_method"],
+        "surface_forcing_constants": json.dumps(
+            config["surface_forcing_constants"],
+            sort_keys=True,
+        ),
+        "surface_forcing_aggregation": config["surface_forcing_aggregation"],
+        "surface_forcing_source": config["surface_forcing_source"],
         "area_method": config["area_method"],
         "regrid_method": config["regrid_method"],
         "source_coordinate_adjustments": json.dumps(
@@ -988,6 +1080,56 @@ def aggregate_model_climatologies(args, target, config, fingerprint):
     }
     output_paths = final_output_paths(args)
     for key, path in output_paths.items():
+        if key == "rho":
+            variable_attrs = {
+                "long_name": (
+                    "Equal-model mean of per-model sea-surface density calculated "
+                    "from regridded monthly-climatological salinity and temperature"
+                ),
+                "units": "kg m-3",
+                "density_method": config["density_method"],
+                "gsw_version": config["gsw_version"],
+                "pressure_dbar": config["density_pressure_dbar"],
+                "source_variables": "sos tos",
+                "density_aggregation": config["density_aggregation"],
+            }
+        elif key in FORCING_KEYS:
+            long_names = {
+                "fsurf": (
+                    "Equal-model mean of per-model buoyancy-relevant surface forcing"
+                ),
+                "heat_comp": (
+                    "Equal-model mean of per-model heat contribution to surface forcing"
+                ),
+                "fw_comp": (
+                    "Equal-model mean of per-model freshwater contribution to surface forcing"
+                ),
+            }
+            descriptions = {
+                "fsurf": "heat_comp + fw_comp",
+                "heat_comp": "(alpha/cp)*hfds",
+                "fw_comp": "(rho0/rho_fw)*beta*S0*wfo",
+            }
+            variable_attrs = {
+                "long_name": long_names[key],
+                "description": descriptions[key],
+                "units": variable_units[key],
+                "forcing_method": config["surface_forcing_method"],
+                "source_variables": "tos sos hfds wfo",
+                "forcing_coefficient_aggregation": config[
+                    "forcing_coefficient_aggregation"
+                ],
+                "surface_forcing_aggregation": config[
+                    "surface_forcing_aggregation"
+                ],
+                **config["surface_forcing_constants"],
+            }
+        else:
+            variable_attrs = {
+                "long_name": f"Equal-model-mean monthly climatology of binned {key}",
+                "source_variable": key,
+                "units": variable_units[key],
+            }
         dataset = xr.Dataset(
             {
                 key: xr.DataArray(
@@ -998,11 +1140,7 @@ def aggregate_model_climatologies(args, target, config, fingerprint):
                         "lat": target["lat"],
                         "lon": target["lon"],
                     },
-                    attrs={
-                        "long_name": f"Equal-model-mean monthly climatology of binned {key}",
-                        "source_variable": key,
-                        "units": variable_units[key],
-                    },
+                    attrs=variable_attrs,
                 ),
                 "model_count": xr.DataArray(
                     model_count,
@@ -1047,6 +1185,10 @@ def aggregate_model_climatologies(args, target, config, fingerprint):
         "model_count_max": int(positive_counts.max()) if positive_counts.size else 0,
         "model_count_zero_cells": int(np.count_nonzero(model_count == 0)),
         "mean_area_total_m2": float(mean_area.sum()),
+        "finite_rho_cells": int(np.count_nonzero(np.isfinite(mmm_values["rho"]))),
+        "finite_fsurf_cells": int(np.count_nonzero(np.isfinite(mmm_values["fsurf"]))),
+        "rho_output_file": str(output_paths["rho"]),
+        "fsurf_output_file": str(output_paths["fsurf"]),
         "coordinate_adjustments": coordinate_adjustments,
     }
     return output_paths, qc
@@ -1061,7 +1203,8 @@ def validate_final_outputs(output_paths, target, expected_models):
         reference = datasets["tos"]
         reference_count = np.asarray(reference["model_count"].values)
         reference_area = np.asarray(reference["areacello"].values)
-        for key in VARIABLE_KEYS:
+        expected_valid = reference_count > 0
+        for key in OUTPUT_KEYS:
             dataset = datasets[key]
             if dataset[key].dims != ("time", "lat", "lon"):
                 raise ValueError(f"Final {key} dimensions are {dataset[key].dims}")
@@ -1082,20 +1225,152 @@ def validate_final_outputs(output_paths, target, expected_models):
                 raise ValueError(f"Final {key} areacello differs from tos")
             if int(np.nanmax(dataset["model_count"].values)) > expected_models:
                 raise ValueError(f"Final {key} model_count exceeds the requested cohort")
+            values = np.asarray(dataset[key].values, dtype=np.float64)
+            if not np.array_equal(np.isfinite(values), expected_valid):
+                raise ValueError(
+                    f"Final {key} finite-value mask differs from shared model_count"
+                )
         if not np.issubdtype(reference["model_count"].dtype, np.integer):
             raise ValueError("Final model_count is not integer-valued")
         if np.any(~np.isfinite(reference_area)) or np.any(reference_area < 0):
             raise ValueError("Final areacello contains invalid values")
+        rho = datasets["rho"]["rho"]
+        if np.any(np.asarray(rho.values)[expected_valid] <= 0.0):
+            raise ValueError("Final rho contains nonpositive values in covered cells")
+        if rho.attrs.get("units") != "kg m-3":
+            raise ValueError("Final rho units are not kg m-3")
+        if rho.attrs.get("density_method") != "gsw.density.rho":
+            raise ValueError("Final rho density method is not gsw.density.rho")
+        if float(rho.attrs.get("pressure_dbar", np.nan)) != 0.0:
+            raise ValueError("Final rho pressure is not zero dbar")
+        if not rho.attrs.get("gsw_version"):
+            raise ValueError("Final rho is missing its GSW version")
+        if rho.attrs.get("density_aggregation") != reference.attrs.get(
+            "density_aggregation"
+        ):
+            raise ValueError("Final rho density-order metadata is inconsistent")
+
+        for key in FORCING_KEYS:
+            forcing = datasets[key][key]
+            if forcing.attrs.get("units") != "kg m-2 s-1":
+                raise ValueError(f"Final {key} units are not kg m-2 s-1")
+            if (
+                forcing.attrs.get("forcing_method")
+                != reference.attrs.get("surface_forcing_method")
+            ):
+                raise ValueError(f"Final {key} forcing method is invalid")
+            if forcing.attrs.get("surface_forcing_aggregation") != reference.attrs.get(
+                "surface_forcing_aggregation"
+            ):
+                raise ValueError(
+                    f"Final {key} surface-forcing order metadata is inconsistent"
+                )
+            expected_constants = {
+                "cp_J_kg-1_K-1": 3990.0,
+                "rho0_kg_m-3": 1027.0,
+                "rho_fw_kg_m-3": 1000.0,
+                "S0": 35.0,
+            }
+            for name, expected in expected_constants.items():
+                if float(forcing.attrs.get(name, np.nan)) != expected:
+                    raise ValueError(f"Final {key} constant {name} is invalid")
+
+        forcing_closure = np.asarray(
+            datasets["fsurf"]["fsurf"].values
+            - datasets["heat_comp"]["heat_comp"].values
+            - datasets["fw_comp"]["fw_comp"].values,
+            dtype=np.float64,
+        )
+        if not np.allclose(
+            forcing_closure[expected_valid],
+            0.0,
+            rtol=1.0e-12,
+            atol=1.0e-18,
+        ):
+            raise ValueError("Final fsurf differs from heat_comp + fw_comp")
 
 
-def calculate_mmm_fgen(args, output_paths):
+def operation_order_difference_qc(saved, from_mean_inputs, comparison, units):
+    saved, from_mean_inputs = xr.align(saved, from_mean_inputs, join="exact")
+    saved = saved.transpose(*from_mean_inputs.dims)
+    saved_values = np.asarray(saved.values, dtype=np.float64)
+    from_mean_values = np.asarray(from_mean_inputs.values, dtype=np.float64)
+    if not np.array_equal(np.isfinite(saved_values), np.isfinite(from_mean_values)):
+        raise ValueError(
+            f"Saved and raw-MMM {saved.name} fields have different finite masks"
+        )
+    difference = saved_values - from_mean_values
+    finite_difference = difference[np.isfinite(difference)]
+    if finite_difference.size == 0:
+        raise ValueError(f"No finite operation-order differences for {saved.name}")
+    return saved, {
+        "comparison": comparison,
+        "units": units,
+        "finite_cells": int(finite_difference.size),
+        "mean_difference": float(finite_difference.mean()),
+        "rmse_difference": float(np.sqrt(np.mean(finite_difference**2))),
+        "maximum_absolute_difference": float(np.max(np.abs(finite_difference))),
+        "minimum_difference": float(finite_difference.min()),
+        "maximum_difference": float(finite_difference.max()),
+    }
+
+
+def calculate_mmm_fgen(args, output_paths, config):
     opened = {}
     fsurf = None
+    from_mean_inputs = None
     try:
         for key, path in output_paths.items():
             opened[key] = xr.open_dataset(path, engine="h5netcdf")
         area = opened["tos"]["areacello"].load()
-        fsurf = fgen.compute_fsurf("MMM", opened, area).load()
+        forcing_inputs = {key: opened[key] for key in VARIABLE_KEYS}
+        from_mean_inputs = fgen.compute_fsurf("MMM", forcing_inputs, area)
+
+        comparisons = {
+            "rho": "mean_model_rho_minus_rho_of_model_mean_inputs",
+            "fsurf": "mean_model_fsurf_minus_fsurf_of_model_mean_inputs",
+            "heat_comp": (
+                "mean_model_heat_comp_minus_heat_comp_of_model_mean_inputs"
+            ),
+            "fw_comp": "mean_model_fw_comp_minus_fw_comp_of_model_mean_inputs",
+        }
+        units = {
+            "rho": "kg m-3",
+            "fsurf": "kg m-2 s-1",
+            "heat_comp": "kg m-2 s-1",
+            "fw_comp": "kg m-2 s-1",
+        }
+        operation_order_qc = {}
+        fsurf = xr.Dataset()
+        for key in DERIVED_KEYS:
+            saved, operation_order_qc[key] = operation_order_difference_qc(
+                opened[key][key],
+                from_mean_inputs[key],
+                comparisons[key],
+                units[key],
+            )
+            fsurf[key] = saved.load()
+
+        forcing_source_files = {
+            key: str(output_paths[key]) for key in FORCING_KEYS
+        }
+        fsurf.attrs.update(
+            density_binning_source=str(output_paths["rho"]),
+            forcing_coefficient_aggregation=config[
+                "forcing_coefficient_aggregation"
+            ],
+            surface_forcing_method=config["surface_forcing_method"],
+            surface_forcing_constants=json.dumps(
+                config["surface_forcing_constants"],
+                sort_keys=True,
+            ),
+            surface_forcing_aggregation=config["surface_forcing_aggregation"],
+            surface_forcing_source=config["surface_forcing_source"],
+            surface_forcing_source_files=json.dumps(
+                forcing_source_files,
+                sort_keys=True,
+            ),
+        )
         rho_classes = np.arange(
             args.rho_min - args.step_size,
             args.rho_max + args.step_size,
@@ -1112,13 +1387,24 @@ def calculate_mmm_fgen(args, output_paths):
             raise ValueError("MMM calculation produced no Fgen rows")
         result.attrs.update(
             model="MMM",
-            method="binned_raw_fields_then_multi_model_mean",
+            method="binned_raw_fields_then_rho_and_fsurf_first_multi_model_mean",
             resolution_degrees=args.resolution,
+            density_aggregation=config["density_aggregation"],
+            density_binning_source=str(output_paths["rho"]),
+            forcing_coefficient_aggregation=config[
+                "forcing_coefficient_aggregation"
+            ],
+            surface_forcing_method=config["surface_forcing_method"],
+            surface_forcing_constants=config["surface_forcing_constants"],
+            surface_forcing_aggregation=config["surface_forcing_aggregation"],
+            surface_forcing_source=config["surface_forcing_source"],
+            surface_forcing_source_files=forcing_source_files,
         )
-        return result
+        return result, operation_order_qc
     finally:
         for dataset in opened.values():
             fgen.safe_close(dataset)
+        fgen.safe_close(from_mean_inputs)
         fgen.safe_close(fsurf)
 
 
@@ -1205,7 +1491,7 @@ def main():
         args, target, config, fingerprint
     )
     validate_final_outputs(output_paths, target, len(args.models))
-    result = calculate_mmm_fgen(args, output_paths)
+    result, operation_order_qc = calculate_mmm_fgen(args, output_paths, config)
     validate_legacy_density_grid(args.legacy_fgen, args.models, result)
 
     aggregation_timing = {
@@ -1224,6 +1510,15 @@ def main():
             "output_files": {key: str(path) for key, path in output_paths.items()},
             "result_file": str(result_output_path(args)),
             "legacy_fgen_file": str(args.legacy_fgen),
+            "rho_source_file": str(output_paths["rho"]),
+            "surface_forcing_source_files": {
+                key: str(output_paths[key]) for key in FORCING_KEYS
+            },
+            "operation_order_qc": operation_order_qc,
+            "rho_qc": operation_order_qc["rho"],
+            "surface_forcing_qc": {
+                key: operation_order_qc[key] for key in FORCING_KEYS
+            },
             **aggregation_qc,
         },
         "result": result,
@@ -1242,6 +1537,17 @@ def main():
     print(
         f"Contributing-model count range: {aggregation_qc['model_count_min']} -> "
         f"{aggregation_qc['model_count_max']}",
+        flush=True,
+    )
+    print(
+        "Rho-first maximum absolute difference from rho(MMM sos, MMM tos): "
+        f"{operation_order_qc['rho']['maximum_absolute_difference']:.6g} kg m-3",
+        flush=True,
+    )
+    print(
+        "Fsurf-first maximum absolute difference from fsurf(MMM inputs): "
+        f"{operation_order_qc['fsurf']['maximum_absolute_difference']:.6g} "
+        "kg m-2 s-1",
         flush=True,
     )
 
